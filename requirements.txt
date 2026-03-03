@@ -1,0 +1,13 @@
+# Graph API Service - Dependencies (Neo4j)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+httpx>=0.25.0
+python-multipart>=0.0.6
+pydantic>=2.5.0
+
+# Neo4j driver
+neo4j>=5.17.0
+
+# Device mapping (embedded SQLite)
+aiosqlite>=0.20.0
+sqlalchemy[asyncio]>=2.0.0
