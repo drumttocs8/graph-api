@@ -503,3 +503,106 @@ async def visualize_d3(model_id: str, max_nodes: int = Query(200, ge=1, le=5000)
     except Exception as e:
         logger.error(f"D3 visualization failed: {e}", exc_info=True)
         raise HTTPException(500, str(e))
+
+
+# ── Graph Enrichment ─────────────────────────────────────────────────────
+
+@app.get("/api/topology/neighbors/{equipment_name}")
+async def get_equipment_neighbors(equipment_name: str):
+    """
+    Return direct neighbors of an equipment node via materialized CONNECTED_TO edges.
+    Falls back to the 4-hop CIM path if CONNECTED_TO hasn't been built yet.
+    """
+    try:
+        # Try materialized shortcut first
+        fast_query = f"""
+        MATCH (eq)-[:CONNECTED_TO]-(neighbor)
+        WHERE eq.`{cim_prop('IdentifiedObject.name')}` =~ $name
+        RETURN DISTINCT
+            neighbor.`{cim_prop('IdentifiedObject.name')}` AS name,
+            [l IN labels(neighbor) WHERE l <> 'Resource' | l][0] AS type,
+            neighbor.uri AS uri
+        ORDER BY name
+        """
+        results = await execute_cypher_async(
+            fast_query,
+            {"name": f"(?i).*{re.escape(equipment_name)}.*"},
+        )
+        if results:
+            return {
+                "success": True,
+                "equipment": equipment_name,
+                "method": "CONNECTED_TO",
+                "neighbors": results,
+            }
+
+        # Fallback: 4-hop CIM path
+        slow_query = f"""
+        MATCH (eq)<-[:`{CIM}Terminal.ConductingEquipment`]-(t1:`{CIM}Terminal`)
+              -[:`{CIM}Terminal.ConnectivityNode`]->(cn:`{CIM}ConnectivityNode`)
+              <-[:`{CIM}Terminal.ConnectivityNode`]-(t2:`{CIM}Terminal`)
+              -[:`{CIM}Terminal.ConductingEquipment`]->(nb)
+        WHERE eq <> nb
+          AND eq.`{cim_prop('IdentifiedObject.name')}` =~ $name
+        RETURN DISTINCT
+            nb.`{cim_prop('IdentifiedObject.name')}` AS name,
+            [l IN labels(nb) WHERE l <> 'Resource' | l][0] AS type,
+            nb.uri AS uri,
+            cn.`{cim_prop('IdentifiedObject.name')}` AS via_cn
+        ORDER BY name
+        """
+        results = await execute_cypher_async(
+            slow_query,
+            {"name": f"(?i).*{re.escape(equipment_name)}.*"},
+        )
+        return {
+            "success": True,
+            "equipment": equipment_name,
+            "method": "CIM_traversal",
+            "neighbors": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/topology/path")
+async def find_path(
+    from_equipment: str = Query(..., description="Source equipment name"),
+    to_equipment: str = Query(..., description="Target equipment name"),
+    max_hops: int = Query(10, ge=1, le=50, description="Maximum path length"),
+):
+    """
+    Find the shortest path between two equipment nodes via CONNECTED_TO edges.
+    Returns the ordered list of equipment in the path.
+    """
+    try:
+        query = f"""
+        MATCH (a), (b)
+        WHERE a.`{cim_prop('IdentifiedObject.name')}` =~ $from_name
+          AND b.`{cim_prop('IdentifiedObject.name')}` =~ $to_name
+        WITH a, b LIMIT 1
+        MATCH path = shortestPath((a)-[:CONNECTED_TO*1..{max_hops}]-(b))
+        RETURN [n IN nodes(path) |
+            {{name: n.`{cim_prop('IdentifiedObject.name')}`,
+              type: [l IN labels(n) WHERE l <> 'Resource' | l][0],
+              uri: n.uri}}] AS path,
+            length(path) AS hops
+        """
+        results = await execute_cypher_async(query, {
+            "from_name": f"(?i).*{re.escape(from_equipment)}.*",
+            "to_name": f"(?i).*{re.escape(to_equipment)}.*",
+        })
+        if results and results[0].get("path"):
+            return {
+                "success": True,
+                "from": from_equipment,
+                "to": to_equipment,
+                "hops": results[0]["hops"],
+                "path": results[0]["path"],
+            }
+        return {
+            "success": False,
+            "message": f"No path found between '{from_equipment}' and '{to_equipment}' within {max_hops} hops",
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
