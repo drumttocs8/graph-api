@@ -32,7 +32,7 @@ from neo4j_client import (
     cypher_list_models, cypher_list_substations,
     cypher_substation_equipment, cypher_substation_transformers,
     cypher_substation_breakers, cypher_substation_voltage_levels,
-    cypher_substation_topology, cypher_list_feeders,
+    cypher_substation_topology, cypher_substation_feeders, cypher_list_feeders,
     cypher_graph_stats, cypher_class_counts,
     cypher_connected_equipment,
     NEO4J_URI,
@@ -263,6 +263,24 @@ async def get_connected_equipment(substation_name: str):
             "substation": substation_name,
             "result_count": len(results),
             "connections": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/feeders")
+async def get_feeders(substation_name: str):
+    """Feeders in a substation with equipment counts and voltage levels."""
+    try:
+        results = await execute_cypher_async(
+            cypher_substation_feeders(substation_name),
+            {"substation_name": f"(?i).*{re.escape(substation_name)}.*"},
+        )
+        return {
+            "success": True,
+            "substation": substation_name,
+            "result_count": len(results),
+            "feeders": results,
         }
     except Exception as e:
         raise HTTPException(500, str(e))

@@ -287,6 +287,26 @@ ORDER BY equipmentName, sequenceNumber
 """
 
 
+def cypher_substation_feeders(substation_name: str) -> str:
+    """Cypher: Feeders in a substation with equipment counts and voltage levels."""
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+OPTIONAL MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+OPTIONAL MATCH (eq)-[:`{cim_prop('ConductingEquipment.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+WITH f, count(DISTINCT eq) AS equipmentCount,
+     collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS voltages
+RETURN
+  elementId(f)           AS feeder,
+  f.`{cim_prop('IdentifiedObject.name')}`  AS name,
+  equipmentCount,
+  voltages
+ORDER BY name
+"""
+
+
 def cypher_list_feeders() -> str:
     """Cypher: List all feeders (mirrors GET /feeders)."""
     return f"""
