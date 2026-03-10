@@ -50,14 +50,14 @@ uvicorn main:app --reload --port 8083
 
 ## Railway Deployment
 
-Internal URL: `http://graph-api.railway.internal:8083`
+Internal URL: `http://graph-api.railway.internal:8080`
 
-### Required Railway Variables
+### Environment Variables (defaults work on Railway)
 ```
-NEO4J_URI=bolt://neo4j.railway.internal:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=<your-password>
-PORT=8083
+NEO4J_URI=bolt://neo4j.railway.internal:7687  (default)
+NEO4J_USER=neo4j                               (default)
+NEO4J_PASSWORD=verance-ai-dev                  (default)
+PORT=8080                                       (Railway-injected)
 ```
 
 ## API Endpoints
@@ -66,20 +66,27 @@ PORT=8083
 - `GET /health` — Service health + Neo4j connectivity
 - `GET /api/neo4j/status` — Neo4j connection details
 
-### Models
+### Discovery
 - `GET /api/models` — List all feeders/substations in Neo4j
-- `GET /api/models/{id}/visualize/d3` — D3.js graph data
-- `GET /api/models/{id}/visualize/mermaid` — Mermaid diagram
+- `GET /api/substations` — List all substations
+- `GET /api/feeders` — List all feeders
 - `GET /api/stats` — Node/relationship count by label
+
+### Substation Detail (by name, case-insensitive)
+- `GET /api/substations/{name}/equipment` — All equipment by type
+- `GET /api/substations/{name}/transformers` — Power transformers + windings
+- `GET /api/substations/{name}/breakers` — Breakers, disconnectors, switches
+- `GET /api/substations/{name}/voltage-levels` — Voltage levels with kV ratings
+- `GET /api/substations/{name}/topology` — Electrical connectivity
+- `GET /api/substations/{name}/connected-equipment` — Equipment connection pairs
+
+### Visualization
+- `GET /api/models/{id}/visualize/d3` — D3.js graph data
 
 ### Import
 - `POST /api/import/rdf` — Import RDF/XML file via n10s
-- `POST /api/import/from-blazegraph` — Pull CIM from Blazegraph via n10s
+- `POST /api/import/from-blazegraph` — Pull CIM from Blazegraph via n10s (migration)
 
 ### Management
-- `DELETE /api/models/{id}` — Delete a model's nodes
-- `DELETE /api/clear-all` — Clear entire graph
+- `DELETE /api/clear-all` — Clear entire graph + re-init n10s
 - `POST /api/cypher` — Execute raw Cypher (escape hatch)
-
-### SPARQL passthrough (backward compat)
-- `POST /api/sparql/query` — Translates common SPARQL patterns to Cypher
