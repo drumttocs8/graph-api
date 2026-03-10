@@ -270,7 +270,7 @@ async def get_connected_equipment(substation_name: str):
 
 @app.get("/api/substations/{substation_name}/feeders")
 async def get_feeders(substation_name: str):
-    """Feeders in a substation with equipment counts and voltage levels."""
+    """Feeders and voltage levels in a substation with equipment counts."""
     try:
         results = await execute_cypher_async(
             cypher_substation_feeders(substation_name),
@@ -280,7 +280,7 @@ async def get_feeders(substation_name: str):
             "success": True,
             "substation": substation_name,
             "result_count": len(results),
-            "feeders": results,
+            "containers": results,
         }
     except Exception as e:
         raise HTTPException(500, str(e))

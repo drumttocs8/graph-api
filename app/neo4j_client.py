@@ -182,103 +182,156 @@ ORDER BY name
 """
 
 
+def _substation_equipment_cte() -> str:
+    """
+    Common subquery that finds equipment in a substation via BOTH containment paths:
+      - Distribution: Equipment → Feeder → Substation
+      - CGMES/Transmission: Equipment → Bay → VoltageLevel → Substation
+    Returns (eq, containerName) for each equipment node.
+    """
+    return f"""
+    // Path 1: Equipment in Feeders (distribution models)
+    CALL {{
+        WITH s
+        MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+        MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 2: Equipment in Bays within VoltageLevels (CGMES models)
+        WITH s
+        MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+        MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+        MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 3: Equipment directly in VoltageLevels (no Bay)
+        WITH s
+        MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+        MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
+        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+          AND NOT eq:{cim_label('Bay')}
+        RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
+    }}
+    """
+
+
 def cypher_substation_equipment(substation_name: str) -> str:
-    """Cypher: Equipment in a substation via its feeders (mirrors GET /substations/:name/equipment)."""
+    """Cypher: Equipment in a substation via feeders OR voltage-levels/bays."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-WITH f, f.`{cim_prop('IdentifiedObject.name')}` AS feederName
-MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}')
-RETURN
+{_substation_equipment_cte()}
+RETURN DISTINCT
   elementId(eq)          AS equipment,
   eq.`{cim_prop('IdentifiedObject.name')}`  AS name,
   [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS type,
-  feederName
+  containerName
 ORDER BY type, name
 """
 
 
 def cypher_substation_transformers(substation_name: str) -> str:
-    """Cypher: Transformers with winding details (mirrors GET /substations/:name/transformers)."""
+    """Cypher: Transformers with winding details via feeders OR voltage-levels/bays."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-WITH f, f.`{cim_prop('IdentifiedObject.name')}` AS feederName
-MATCH (t:{cim_label('PowerTransformer')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-OPTIONAL MATCH (w:{cim_label('PowerTransformerEnd')})-[:`{cim_prop('PowerTransformerEnd.PowerTransformer')}`]->(t)
+{_substation_equipment_cte()}
+WITH DISTINCT eq, containerName
+WHERE eq:{cim_label('PowerTransformer')}
+OPTIONAL MATCH (w:{cim_label('PowerTransformerEnd')})-[:`{cim_prop('PowerTransformerEnd.PowerTransformer')}`]->(eq)
+OPTIONAL MATCH (w)-[:`{cim_prop('TransformerEnd.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
 RETURN
-  elementId(t)           AS transformer,
-  t.`{cim_prop('IdentifiedObject.name')}`  AS name,
-  feederName,
+  elementId(eq)           AS transformer,
+  eq.`{cim_prop('IdentifiedObject.name')}`  AS name,
+  containerName,
   w.`{cim_prop('IdentifiedObject.name')}`           AS windingName,
   w.`{cim_prop('PowerTransformerEnd.ratedU')}`       AS ratedU,
   w.`{cim_prop('PowerTransformerEnd.ratedS')}`       AS ratedS,
   w.`{cim_prop('PowerTransformerEnd.connectionKind')}` AS connectionKind,
-  w.`{cim_prop('TransformerEnd.endNumber')}`         AS endNumber
+  w.`{cim_prop('TransformerEnd.endNumber')}`         AS endNumber,
+  bv.`{cim_prop('BaseVoltage.nominalVoltage')}`      AS baseVoltage
 ORDER BY name, endNumber
 """
 
 
 def cypher_substation_breakers(substation_name: str) -> str:
-    """Cypher: Breakers and switching devices (mirrors GET /substations/:name/breakers)."""
+    """Cypher: Breakers and switching devices via feeders OR voltage-levels/bays."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-WITH f, f.`{cim_prop('IdentifiedObject.name')}` AS feederName
-MATCH (sw)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-WHERE any(lbl IN labels(sw) WHERE lbl IN [
+{_substation_equipment_cte()}
+WITH DISTINCT eq, containerName
+WHERE any(lbl IN labels(eq) WHERE lbl IN [
   '{cim_label("Breaker")}', '{cim_label("Disconnector")}',
   '{cim_label("LoadBreakSwitch")}', '{cim_label("Recloser")}', '{cim_label("Fuse")}'
 ])
 RETURN
-  elementId(sw)          AS switch,
-  sw.`{cim_prop('IdentifiedObject.name')}`  AS name,
-  [lbl IN labels(sw) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS type,
-  feederName,
-  sw.`{cim_prop('Switch.normalOpen')}`  AS normalOpen,
-  sw.`{cim_prop('Switch.retained')}`    AS retained
+  elementId(eq)          AS switch,
+  eq.`{cim_prop('IdentifiedObject.name')}`  AS name,
+  [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS type,
+  containerName,
+  eq.`{cim_prop('Switch.normalOpen')}`  AS normalOpen,
+  eq.`{cim_prop('Switch.retained')}`    AS retained
 ORDER BY type, name
 """
 
 
 def cypher_substation_voltage_levels(substation_name: str) -> str:
-    """Cypher: Base voltages in a substation's feeders (mirrors GET /substations/:name/voltage-levels)."""
+    """Cypher: Voltage levels in a substation (CGMES VoltageLevel or base voltages from feeders)."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-MATCH (eq)-[:`{cim_prop('ConductingEquipment.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+CALL {{
+    // CGMES: VoltageLevel objects directly under Substation
+    WITH s
+    MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+    OPTIONAL MATCH (vl)-[:`{cim_prop('VoltageLevel.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+    RETURN
+      elementId(vl) AS voltageLevelId,
+      vl.`{cim_prop('IdentifiedObject.name')}` AS voltageLevelName,
+      elementId(bv) AS baseVoltageId,
+      bv.`{cim_prop('BaseVoltage.nominalVoltage')}` AS nominalVoltage
+  UNION
+    // Distribution: BaseVoltage from equipment in feeders
+    WITH s
+    MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+    MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+    MATCH (eq)-[:`{cim_prop('ConductingEquipment.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+    RETURN
+      null AS voltageLevelId,
+      null AS voltageLevelName,
+      elementId(bv) AS baseVoltageId,
+      bv.`{cim_prop('BaseVoltage.nominalVoltage')}` AS nominalVoltage
+}}
 RETURN DISTINCT
-  elementId(bv)          AS baseVoltage,
-  bv.`{cim_prop('BaseVoltage.nominalVoltage')}`  AS nominalVoltage
+  voltageLevelId,
+  voltageLevelName,
+  baseVoltageId,
+  nominalVoltage
 ORDER BY nominalVoltage DESC
 """
 
 
 def cypher_substation_topology(substation_name: str) -> str:
-    """Cypher: Connectivity topology (mirrors GET /substations/:name/topology)."""
+    """Cypher: Connectivity topology via feeders OR voltage-levels/bays."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-WITH f, f.`{cim_prop('IdentifiedObject.name')}` AS feederName
-MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+{_substation_equipment_cte()}
+WITH DISTINCT eq, containerName
 MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(eq)
 MATCH (t)-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn:{cim_label('ConnectivityNode')})
 RETURN
   eq.`{cim_prop('IdentifiedObject.name')}`   AS equipmentName,
   [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS equipmentType,
-  feederName,
+  containerName,
   t.`{cim_prop('IdentifiedObject.name')}`    AS terminalName,
   elementId(cn)                              AS connectivityNode,
   cn.`{cim_prop('IdentifiedObject.name')}`   AS cnName,
@@ -288,21 +341,39 @@ ORDER BY equipmentName, sequenceNumber
 
 
 def cypher_substation_feeders(substation_name: str) -> str:
-    """Cypher: Feeders in a substation with equipment counts and voltage levels."""
+    """Cypher: Feeders AND voltage levels in a substation with equipment counts."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-OPTIONAL MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-OPTIONAL MATCH (eq)-[:`{cim_prop('ConductingEquipment.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
-WITH f, count(DISTINCT eq) AS equipmentCount,
-     collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS voltages
-RETURN
-  elementId(f)           AS feeder,
-  f.`{cim_prop('IdentifiedObject.name')}`  AS name,
-  equipmentCount,
-  voltages
+CALL {{
+    // Feeders (distribution models)
+    WITH s
+    MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+    OPTIONAL MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+    OPTIONAL MATCH (eq)-[:`{cim_prop('ConductingEquipment.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+    WITH f AS container, 'Feeder' AS containerType,
+         count(DISTINCT eq) AS equipmentCount,
+         collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS voltages
+    RETURN elementId(container) AS containerId,
+           container.`{cim_prop('IdentifiedObject.name')}` AS name,
+           containerType, equipmentCount, voltages
+  UNION
+    // Voltage Levels (CGMES models)
+    WITH s
+    MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+    OPTIONAL MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
+    OPTIONAL MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+    OPTIONAL MATCH (bayEq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+    OPTIONAL MATCH (vl)-[:`{cim_prop('VoltageLevel.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+    WITH vl AS container, 'VoltageLevel' AS containerType,
+         count(DISTINCT eq) + count(DISTINCT bayEq) AS equipmentCount,
+         collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS voltages
+    RETURN elementId(container) AS containerId,
+           container.`{cim_prop('IdentifiedObject.name')}` AS name,
+           containerType, equipmentCount, voltages
+}}
+RETURN containerId, name, containerType, equipmentCount, voltages
 ORDER BY name
 """
 
@@ -348,19 +419,18 @@ LIMIT 30
 
 
 def cypher_connected_equipment(substation_name: str) -> str:
-    """Cypher: Equipment connected via connectivity nodes (mirrors /connected-equipment)."""
+    """Cypher: Equipment connected via connectivity nodes (both containment paths)."""
     return f"""
 MATCH (s:{cim_label('Substation')})
 WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
-MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
-MATCH (eq1)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+{_substation_equipment_cte()}
+WITH DISTINCT eq AS eq1, containerName
 MATCH (t1:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(eq1)
 MATCH (t1)-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn)
 MATCH (t2:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn)
 MATCH (t2)-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(eq2)
 WHERE eq1 <> eq2
-MATCH (eq2)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
 RETURN DISTINCT
   eq1.`{cim_prop('IdentifiedObject.name')}` AS eq1Name,
   [lbl IN labels(eq1) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS eq1Type,
