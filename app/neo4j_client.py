@@ -184,21 +184,29 @@ ORDER BY name
 
 def _substation_equipment_cte() -> str:
     """
-    Common subquery that finds equipment in a substation via BOTH containment paths:
+    Common subquery that finds equipment in a substation via ALL containment paths:
+      - Direct: Equipment → Substation (some CGMES models)
       - Distribution: Equipment → Feeder → Substation
       - CGMES/Transmission: Equipment → Bay → VoltageLevel → Substation
+      - CGMES direct VL: Equipment → VoltageLevel → Substation
     Returns (eq, containerName) for each equipment node.
     """
     return f"""
-    // Path 1: Equipment in Feeders (distribution models)
     CALL {{
+        // Path 1: Equipment directly in Substation
+        WITH s
+        MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(s)
+        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN eq, s.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 2: Equipment in Feeders (distribution models)
         WITH s
         MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
         WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
         RETURN eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
-        // Path 2: Equipment in Bays within VoltageLevels (CGMES models)
+        // Path 3: Equipment in Bays within VoltageLevels (CGMES models)
         WITH s
         MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
         MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
@@ -206,7 +214,7 @@ def _substation_equipment_cte() -> str:
         WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
         RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
-        // Path 3: Equipment directly in VoltageLevels (no Bay)
+        // Path 4: Equipment directly in VoltageLevels (no Bay)
         WITH s
         MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
