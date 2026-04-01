@@ -35,6 +35,8 @@ from neo4j_client import (
     cypher_substation_topology, cypher_substation_feeders, cypher_list_feeders,
     cypher_graph_stats, cypher_class_counts,
     cypher_connected_equipment,
+    cypher_equipment_connected, cypher_isolation_boundary,
+    cypher_network_summary, cypher_enhanced_topology,
     NEO4J_URI,
 )
 
@@ -291,6 +293,115 @@ async def list_feeders():
     try:
         results = await execute_cypher_async(cypher_list_feeders())
         return {"success": True, "result_count": len(results), "feeders": results}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── P3: Equipment Connectivity ───────────────────────────────────────────
+
+@app.get("/api/equipment/{equipment_name}/connected")
+async def get_equipment_connected(equipment_name: str):
+    """All equipment directly connected to a named piece of equipment via CIM Terminal→ConnectivityNode→Terminal traversal.
+
+    Works for any equipment type: transformers, breakers, busbars, etc.
+    Returns the connectivity node used as the junction point.
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_equipment_connected(equipment_name),
+            {"equipment_name": f"(?i).*{re.escape(equipment_name)}.*"},
+        )
+        return {
+            "success": True,
+            "equipment": equipment_name,
+            "result_count": len(results),
+            "connected": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── P4: Isolation Boundary ───────────────────────────────────────────────
+
+@app.get("/api/equipment/{equipment_name}/isolation-boundary")
+async def get_isolation_boundary(equipment_name: str):
+    """Find all switchable devices (breakers, disconnectors) forming the isolation boundary around a piece of equipment.
+
+    Uses BFS outward from the target equipment through the CIM connectivity graph.
+    Traverses through non-switchable equipment (busbars, CTs, VTs) and stops at
+    any switchable device. Works for any topology: radial, ring, double-bus,
+    breaker-and-a-half, etc.
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_isolation_boundary(equipment_name),
+            {"equipment_name": f"(?i).*{re.escape(equipment_name)}.*"},
+        )
+        equipment_type = results[0]["equipmentType"] if results else None
+        return {
+            "success": True,
+            "equipment": equipment_name,
+            "equipment_type": equipment_type,
+            "boundary_count": len(results),
+            "isolation_boundary": [
+                {
+                    "switch_name": r["boundary_switch"],
+                    "switch_type": r["switch_type"],
+                    "normally_open": r["normally_open"],
+                }
+                for r in results
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── P5: Network Summary ─────────────────────────────────────────────────
+
+@app.get("/api/network-summary")
+async def network_summary():
+    """Per-substation summary: equipment counts by type, voltage levels, total transformer MVA.
+
+    Returns a comprehensive overview of the entire network in one call,
+    useful for high-level reporting and cross-substation comparison.
+    """
+    try:
+        results = await execute_cypher_async(cypher_network_summary())
+        total_equipment = sum(r.get("totalEquipment", 0) for r in results)
+        total_mva = sum(r.get("totalMVA", 0) or 0 for r in results)
+        return {
+            "success": True,
+            "substation_count": len(results),
+            "total_equipment": total_equipment,
+            "total_transformer_mva": total_mva,
+            "substations": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── P6: Enhanced Topology ───────────────────────────────────────────────
+
+@app.get("/api/substations/{substation_name}/topology/enhanced")
+async def get_enhanced_topology(substation_name: str):
+    """Enhanced topology analysis: busbar arrangement classification and breaker role identification.
+
+    Per voltage level, returns:
+    - Busbar count and arrangement type (single_bus, double_bus, multi_bus)
+    - Breaker classification (bus_section vs feeder) based on connectivity to busbars
+    - Bus section breaker = connected to 2+ busbars, feeder breaker = connected to 1 busbar
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_enhanced_topology(substation_name),
+            {"substation_name": f"(?i).*{re.escape(substation_name)}.*"},
+        )
+        return {
+            "success": True,
+            "substation": substation_name,
+            "voltage_levels": len(results),
+            "topology": results,
+        }
     except Exception as e:
         raise HTTPException(500, str(e))
 

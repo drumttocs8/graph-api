@@ -426,6 +426,284 @@ LIMIT 30
 """
 
 
+def cypher_equipment_connected(equipment_name: str) -> str:
+    """Cypher: All equipment directly connected to a named piece of equipment via Terminal→CN→Terminal traversal."""
+    return f"""
+MATCH (eq)
+WHERE eq.`{cim_prop('IdentifiedObject.name')}` =~ $equipment_name
+  AND any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+WITH eq
+MATCH (t1:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(eq)
+MATCH (t1)-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn:{cim_label('ConnectivityNode')})
+MATCH (t2:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn)
+MATCH (t2)-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(neighbor)
+WHERE eq <> neighbor
+RETURN DISTINCT
+  eq.`{cim_prop('IdentifiedObject.name')}` AS equipment,
+  [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS equipmentType,
+  cn.`{cim_prop('IdentifiedObject.name')}` AS via_connectivity_node,
+  neighbor.`{cim_prop('IdentifiedObject.name')}` AS connected_equipment,
+  [lbl IN labels(neighbor) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS connected_type
+ORDER BY connected_equipment
+"""
+
+
+def cypher_isolation_boundary(equipment_name: str) -> str:
+    """Cypher: BFS outward from equipment, collecting switchable devices as the isolation boundary.
+
+    Traverses through non-switchable equipment (busbars, CTs, VTs, line segments)
+    and stops at any switchable device (Breaker, Disconnector, LoadBreakSwitch, Fuse, Recloser).
+    Works for any topology: radial, ring, breaker-and-a-half, etc.
+    """
+    switchable = ", ".join([
+        f"'{cim_label('Breaker')}'",
+        f"'{cim_label('Disconnector')}'",
+        f"'{cim_label('LoadBreakSwitch')}'",
+        f"'{cim_label('Fuse')}'",
+        f"'{cim_label('Recloser')}'",
+    ])
+    return f"""
+// Find the target equipment
+MATCH (start)
+WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $equipment_name
+  AND any(lbl IN labels(start) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+WITH start
+
+// BFS: traverse Terminal→CN→Terminal→Equipment, collecting switches
+MATCH path = (start)<-[:`{cim_prop('Terminal.ConductingEquipment')}`]-
+             (:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->
+             (:{cim_label('ConnectivityNode')})
+             <-[:`{cim_prop('Terminal.ConnectivityNode')}`]-
+             (:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->
+             (hop1)
+WHERE hop1 <> start
+WITH start, hop1,
+     [lbl IN labels(hop1) WHERE lbl IN [{switchable}]] AS switchLabels
+
+// If hop1 is a switch → it's a boundary device
+// If hop1 is non-switchable → traverse one more hop to find switch behind it
+WITH start, hop1, switchLabels,
+     CASE WHEN size(switchLabels) > 0 THEN true ELSE false END AS isBoundary
+
+// Collect direct boundary switches
+WITH start,
+     CASE WHEN isBoundary THEN hop1 ELSE null END AS boundarySwitch,
+     CASE WHEN NOT isBoundary THEN hop1 ELSE null END AS passthrough
+WITH start, collect(DISTINCT boundarySwitch) AS directBoundary, collect(DISTINCT passthrough) AS passthroughs
+
+// For passthrough equipment, look one more hop
+UNWIND (CASE WHEN size(passthroughs) = 0 THEN [null] ELSE passthroughs END) AS pt
+OPTIONAL MATCH (pt)<-[:`{cim_prop('Terminal.ConductingEquipment')}`]-
+               (:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->
+               (:{cim_label('ConnectivityNode')})
+               <-[:`{cim_prop('Terminal.ConnectivityNode')}`]-
+               (:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->
+               (hop2)
+WHERE hop2 <> start AND hop2 <> pt
+  AND any(lbl IN labels(hop2) WHERE lbl IN [{switchable}])
+WITH start, directBoundary, collect(DISTINCT hop2) AS indirectBoundary
+
+// Combine all boundary switches
+WITH start, directBoundary + indirectBoundary AS allBoundary
+UNWIND allBoundary AS sw
+WITH DISTINCT start, sw
+WHERE sw IS NOT NULL
+RETURN
+  start.`{cim_prop('IdentifiedObject.name')}` AS equipment,
+  [lbl IN labels(start) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS equipmentType,
+  sw.`{cim_prop('IdentifiedObject.name')}` AS boundary_switch,
+  [lbl IN labels(sw) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS switch_type,
+  sw.`{cim_prop('Switch.normalOpen')}` AS normally_open
+ORDER BY boundary_switch
+"""
+
+
+def cypher_network_summary() -> str:
+    """Cypher: Per-substation summary with equipment counts, voltage levels, and transformer capacity."""
+    return f"""
+MATCH (s:{cim_label('Substation')})
+OPTIONAL MATCH (s)-[:`{cim_prop('Substation.Region')}`]->(r)
+
+// Equipment counts per substation (all containment paths)
+CALL {{
+    WITH s
+    // Direct
+    OPTIONAL MATCH (eq1)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(s)
+    WHERE any(lbl IN labels(eq1) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+    WITH s, collect(DISTINCT eq1) AS direct
+    // Via VoltageLevel
+    OPTIONAL MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+    OPTIONAL MATCH (eq2)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
+    WHERE any(lbl IN labels(eq2) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+      AND NOT eq2:{cim_label('Bay')}
+    WITH s, direct, collect(DISTINCT eq2) AS vlEquip
+    // Via Bay
+    OPTIONAL MATCH (vl2:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+    OPTIONAL MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl2)
+    OPTIONAL MATCH (eq3)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+    WHERE any(lbl IN labels(eq3) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+    WITH s, direct, vlEquip, collect(DISTINCT eq3) AS bayEquip
+    // Via Feeder
+    OPTIONAL MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+    OPTIONAL MATCH (eq4)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+    WHERE any(lbl IN labels(eq4) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+    WITH s, direct + vlEquip + bayEquip + collect(DISTINCT eq4) AS allEquip
+    UNWIND allEquip AS eq
+    WITH DISTINCT s, eq
+    WITH s, count(eq) AS totalEquipment,
+         count(CASE WHEN eq:{cim_label('Breaker')} THEN 1 END) AS breakers,
+         count(CASE WHEN eq:{cim_label('Disconnector')} THEN 1 END) AS disconnectors,
+         count(CASE WHEN eq:{cim_label('PowerTransformer')} THEN 1 END) AS transformers,
+         count(CASE WHEN eq:{cim_label('BusbarSection')} THEN 1 END) AS busbars,
+         count(CASE WHEN eq:{cim_label('ACLineSegment')} THEN 1 END) AS lineSegments,
+         count(CASE WHEN eq:{cim_label('EnergyConsumer')} THEN 1 END) AS loads,
+         count(CASE WHEN eq:{cim_label('ProtectiveRelay')} THEN 1 END) AS protectionRelays
+    RETURN s, totalEquipment, breakers, disconnectors, transformers, busbars,
+           lineSegments, loads, protectionRelays
+}}
+WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
+     lineSegments, loads, protectionRelays
+
+// Voltage levels
+OPTIONAL MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+OPTIONAL MATCH (vl)-[:`{cim_prop('VoltageLevel.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
+     lineSegments, loads, protectionRelays,
+     collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS voltages
+
+// Transformer capacity (sum of highest-voltage winding ratedS per transformer)
+OPTIONAL MATCH (pt:{cim_label('PowerTransformer')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(s)
+OPTIONAL MATCH (pte:{cim_label('PowerTransformerEnd')})-[:`{cim_prop('PowerTransformerEnd.PowerTransformer')}`]->(pt)
+WHERE pte.`{cim_prop('TransformerEnd.endNumber')}` = 1
+WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
+     lineSegments, loads, protectionRelays, voltages,
+     sum(CASE WHEN pte IS NOT NULL THEN toFloat(pte.`{cim_prop('PowerTransformerEnd.ratedS')}`) ELSE 0 END) AS totalMVA_direct
+
+// Also check transformers in VoltageLevel containers
+OPTIONAL MATCH (vl2:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+OPTIONAL MATCH (pt2:{cim_label('PowerTransformer')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl2)
+OPTIONAL MATCH (pte2:{cim_label('PowerTransformerEnd')})-[:`{cim_prop('PowerTransformerEnd.PowerTransformer')}`]->(pt2)
+WHERE pte2.`{cim_prop('TransformerEnd.endNumber')}` = 1
+WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
+     lineSegments, loads, protectionRelays, voltages,
+     totalMVA_direct + sum(CASE WHEN pte2 IS NOT NULL THEN toFloat(pte2.`{cim_prop('PowerTransformerEnd.ratedS')}`) ELSE 0 END) AS totalMVA
+
+RETURN
+  s.`{cim_prop('IdentifiedObject.name')}` AS substation,
+  r.`{cim_prop('IdentifiedObject.name')}` AS region,
+  totalEquipment,
+  breakers,
+  disconnectors,
+  transformers,
+  busbars,
+  lineSegments,
+  loads,
+  protectionRelays,
+  voltages,
+  totalMVA
+ORDER BY substation
+"""
+
+
+def cypher_enhanced_topology(substation_name: str) -> str:
+    """Cypher: Enhanced topology with busbar arrangement classification and breaker roles."""
+    switchable = ", ".join([
+        f"'{cim_label('Breaker')}'",
+        f"'{cim_label('Disconnector')}'",
+        f"'{cim_label('LoadBreakSwitch')}'",
+    ])
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+
+// Get voltage levels
+MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+OPTIONAL MATCH (vl)-[:`{cim_prop('VoltageLevel.BaseVoltage')}`]->(bv:{cim_label('BaseVoltage')})
+WITH s, vl, bv.`{cim_prop('BaseVoltage.nominalVoltage')}` AS nominalKV
+
+// Count busbars per voltage level
+OPTIONAL MATCH (bb:{cim_label('BusbarSection')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
+WITH s, vl, nominalKV, collect(DISTINCT bb) AS busbars, count(DISTINCT bb) AS busbarCount
+
+// Classify busbar arrangement
+WITH s, vl, nominalKV, busbars, busbarCount,
+     CASE
+       WHEN busbarCount = 0 THEN 'no_busbars'
+       WHEN busbarCount = 1 THEN 'single_bus'
+       WHEN busbarCount = 2 THEN 'double_bus'
+       ELSE 'multi_bus'
+     END AS busbarArrangement
+
+// Also check busbars in bays
+OPTIONAL MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+OPTIONAL MATCH (bb2:{cim_label('BusbarSection')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+WITH s, vl, nominalKV, busbars + collect(DISTINCT bb2) AS allBusbars,
+     busbarCount + count(DISTINCT bb2) AS totalBusbars,
+     CASE
+       WHEN busbarCount + count(DISTINCT bb2) = 0 THEN 'no_busbars'
+       WHEN busbarCount + count(DISTINCT bb2) = 1 THEN 'single_bus'
+       WHEN busbarCount + count(DISTINCT bb2) = 2 THEN 'double_bus'
+       ELSE 'multi_bus'
+     END AS arrangement
+
+// Classify breakers: bus_section (connected to 2+ busbars) vs feeder (connected to 1 busbar)
+OPTIONAL MATCH (brk:{cim_label('Breaker')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
+OPTIONAL MATCH (t1:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(brk)
+OPTIONAL MATCH (t1)-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn:{cim_label('ConnectivityNode')})
+OPTIONAL MATCH (t2:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn)
+OPTIONAL MATCH (t2)-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(connBB:{cim_label('BusbarSection')})
+
+WITH s, vl, nominalKV, totalBusbars, arrangement,
+     [bb IN allBusbars | bb.`{cim_prop('IdentifiedObject.name')}`] AS busbarNames,
+     brk, count(DISTINCT connBB) AS connectedBusbars
+WITH s, vl, nominalKV, totalBusbars, arrangement, busbarNames,
+     collect(CASE WHEN brk IS NOT NULL THEN {{
+       name: brk.`{cim_prop('IdentifiedObject.name')}`,
+       normalOpen: brk.`{cim_prop('Switch.normalOpen')}`,
+       role: CASE
+         WHEN connectedBusbars >= 2 THEN 'bus_section'
+         WHEN connectedBusbars = 1 THEN 'feeder'
+         ELSE 'unclassified'
+       END,
+       connectedBusbars: connectedBusbars
+     }} END) AS breakerClassification
+
+// Also check breakers in bays
+OPTIONAL MATCH (bay2:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+OPTIONAL MATCH (brk2:{cim_label('Breaker')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay2)
+OPTIONAL MATCH (t3:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(brk2)
+OPTIONAL MATCH (t3)-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn2:{cim_label('ConnectivityNode')})
+OPTIONAL MATCH (t4:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConnectivityNode')}`]->(cn2)
+OPTIONAL MATCH (t4)-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(connBB2:{cim_label('BusbarSection')})
+
+WITH s, vl, nominalKV, totalBusbars, arrangement, busbarNames, breakerClassification,
+     brk2, count(DISTINCT connBB2) AS connectedBusbars2
+WITH s, vl, nominalKV, totalBusbars, arrangement, busbarNames,
+     breakerClassification + collect(CASE WHEN brk2 IS NOT NULL THEN {{
+       name: brk2.`{cim_prop('IdentifiedObject.name')}`,
+       normalOpen: brk2.`{cim_prop('Switch.normalOpen')}`,
+       role: CASE
+         WHEN connectedBusbars2 >= 2 THEN 'bus_section'
+         WHEN connectedBusbars2 = 1 THEN 'feeder'
+         ELSE 'unclassified'
+       END,
+       connectedBusbars: connectedBusbars2
+     }} END) AS allBreakers
+
+RETURN
+  vl.`{cim_prop('IdentifiedObject.name')}` AS voltageLevel,
+  nominalKV,
+  totalBusbars,
+  arrangement,
+  busbarNames,
+  [b IN allBreakers WHERE b IS NOT NULL AND b.name IS NOT NULL] AS breakers,
+  size([b IN allBreakers WHERE b IS NOT NULL AND b.role = 'bus_section']) AS busSectionBreakers,
+  size([b IN allBreakers WHERE b IS NOT NULL AND b.role = 'feeder']) AS feederBreakers
+ORDER BY nominalKV DESC
+"""
+
+
 def cypher_connected_equipment(substation_name: str) -> str:
     """Cypher: Equipment connected via connectivity nodes (both containment paths)."""
     return f"""
