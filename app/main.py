@@ -177,10 +177,10 @@ async def get_all_types(substation_name: str):
         CALL {
             WITH s
             MATCH path = (s)-[*1..5]-(n)
-            WHERE any(lbl IN labels(n) WHERE lbl STARTS WITH 'cim__' AND lbl <> 'Resource')
+            WHERE any(lbl IN labels(n) WHERE (lbl STARTS WITH 'cim__' OR lbl STARTS WITH 'ns1__') AND lbl <> 'Resource')
             WITH DISTINCT n,
-                 [lbl IN labels(n) WHERE lbl STARTS WITH 'cim__' AND lbl <> 'Resource'
-                  | replace(lbl, 'cim__', '')][0] AS type
+                 [lbl IN labels(n) WHERE (lbl STARTS WITH 'cim__' OR lbl STARTS WITH 'ns1__') AND lbl <> 'Resource'
+                  | replace(replace(lbl, 'cim__', ''), 'ns1__', '')][0] AS type
             WHERE type IS NOT NULL
             RETURN type, count(*) AS cnt
         }

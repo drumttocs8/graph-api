@@ -32,6 +32,8 @@ NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "verance-ai-dev")
 
 # CIM namespace prefix as shortened by n10s
 CIM = "cim__"  # n10s SHORTEN mode turns "http://iec.ch/TC57/CIM100#" → "cim__"
+# Verance secondary-system namespace prefix (SCADA, network, protection devices)
+VER = "ns1__"
 
 # ── Synchronous driver (for Flask services) ───────────────────────────────
 
@@ -192,20 +194,23 @@ def _substation_equipment_cte() -> str:
       - Auxiliary: AuxiliaryEquipment via Terminal → ConductingEquipment in substation
       - Measurement: Measurement via Terminal → ConductingEquipment in substation
     Returns (eq, containerName) for each equipment node.
+    Finds both cim__ (standard CIM) and ns1__ (Verance SCADA/network) labelled nodes.
     """
+    # Match nodes with either CIM or Verance namespace labels
+    lbl_filter = f"(lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource'"
     return f"""
     CALL {{
         // Path 1: Equipment directly in Substation
         WITH s
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(s)
-        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(eq) WHERE {lbl_filter})
         RETURN eq, s.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 2: Equipment in Feeders (distribution models)
         WITH s
         MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
-        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(eq) WHERE {lbl_filter})
         RETURN eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 3: Equipment in Bays within VoltageLevels (CGMES models)
@@ -213,14 +218,14 @@ def _substation_equipment_cte() -> str:
         MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
         MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
-        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(eq) WHERE {lbl_filter})
         RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 4: Equipment directly in VoltageLevels (no Bay)
         WITH s
         MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
         MATCH (eq)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl)
-        WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(eq) WHERE {lbl_filter})
           AND NOT eq:{cim_label('Bay')}
         RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
@@ -231,7 +236,7 @@ def _substation_equipment_cte() -> str:
         MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
         MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
         MATCH (aux)-[:`{cim_prop('AuxiliaryEquipment.Terminal')}`]->(t)
-        WHERE any(lbl IN labels(aux) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(aux) WHERE {lbl_filter})
         RETURN aux AS eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 6: AuxiliaryEquipment via Terminal → ConductingEquipment in Feeders
@@ -240,7 +245,7 @@ def _substation_equipment_cte() -> str:
         MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
         MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
         MATCH (aux)-[:`{cim_prop('AuxiliaryEquipment.Terminal')}`]->(t)
-        WHERE any(lbl IN labels(aux) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(aux) WHERE {lbl_filter})
         RETURN aux AS eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 7: Measurement nodes via Terminal → ConductingEquipment in substation
@@ -250,7 +255,7 @@ def _substation_equipment_cte() -> str:
         MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
         MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
         MATCH (m)-[:`{cim_prop('Measurement.Terminal')}`]->(t)
-        WHERE any(lbl IN labels(m) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(m) WHERE {lbl_filter})
         RETURN m AS eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
       UNION
         // Path 8: Measurement nodes via Terminal → ConductingEquipment in Feeders
@@ -259,7 +264,7 @@ def _substation_equipment_cte() -> str:
         MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
         MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
         MATCH (m)-[:`{cim_prop('Measurement.Terminal')}`]->(t)
-        WHERE any(lbl IN labels(m) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        WHERE any(lbl IN labels(m) WHERE {lbl_filter})
         RETURN m AS eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
     }}
     """
@@ -275,7 +280,7 @@ WITH s
 RETURN DISTINCT
   elementId(eq)          AS equipment,
   eq.`{cim_prop('IdentifiedObject.name')}`  AS name,
-  [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS type,
+  [lbl IN labels(eq) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0] AS type,
   containerName
 ORDER BY type, name
 """
@@ -321,7 +326,7 @@ WHERE any(lbl IN labels(eq) WHERE lbl IN [
 RETURN
   elementId(eq)          AS switch,
   eq.`{cim_prop('IdentifiedObject.name')}`  AS name,
-  [lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource' | replace(lbl, '{CIM}', '')][0] AS type,
+  [lbl IN labels(eq) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0] AS type,
   containerName,
   eq.`{cim_prop('Switch.normalOpen')}`  AS normalOpen,
   eq.`{cim_prop('Switch.retained')}`    AS retained
@@ -454,15 +459,15 @@ RETURN totalNodes, totalRelationships
 
 
 def cypher_class_counts() -> str:
-    """Cypher: Count nodes by CIM label (mirrors class distribution in triplestore/stats)."""
+    """Cypher: Count nodes by CIM/Verance label (mirrors class distribution in triplestore/stats)."""
     return f"""
 MATCH (n)
-WHERE any(lbl IN labels(n) WHERE lbl STARTS WITH '{CIM}')
-UNWIND [lbl IN labels(n) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource'] AS cimLabel
-WITH replace(cimLabel, '{CIM}', '') AS type, count(*) AS count
+WHERE any(lbl IN labels(n) WHERE lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
+UNWIND [lbl IN labels(n) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource'] AS nsLabel
+WITH replace(replace(nsLabel, '{CIM}', ''), '{VER}', '') AS type, count(*) AS count
 RETURN type, count
 ORDER BY count DESC
-LIMIT 30
+LIMIT 50
 """
 
 
