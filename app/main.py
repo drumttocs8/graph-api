@@ -166,6 +166,39 @@ async def list_substations_endpoint():
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/substations/{substation_name}/all-types")
+async def get_all_types(substation_name: str):
+    """Discover all CIM node types reachable from a substation (up to 5 hops)."""
+    try:
+        query = """
+        MATCH (s)
+        WHERE any(lbl IN labels(s) WHERE lbl ENDS WITH 'Substation')
+          AND any(prop IN keys(s) WHERE s[prop] =~ $substation_name)
+        CALL {
+            WITH s
+            MATCH path = (s)-[*1..5]-(n)
+            WHERE any(lbl IN labels(n) WHERE lbl STARTS WITH 'http')
+            WITH DISTINCT n,
+                 [lbl IN labels(n) WHERE lbl STARTS WITH 'http' AND NOT lbl ENDS WITH 'Resource'
+                  | split(lbl, '#')[-1]][0] AS type
+            WHERE type IS NOT NULL
+            RETURN type, count(*) AS cnt
+        }
+        RETURN type, cnt ORDER BY cnt DESC
+        """
+        results = await execute_cypher_async(
+            query,
+            {"substation_name": f"(?i).*{re.escape(substation_name)}.*"},
+        )
+        return {
+            "success": True,
+            "substation": substation_name,
+            "types": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/substations/{substation_name}/equipment")
 async def get_equipment(substation_name: str):
     """All equipment in a substation's feeders."""
