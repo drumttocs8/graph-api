@@ -189,6 +189,8 @@ def _substation_equipment_cte() -> str:
       - Distribution: Equipment → Feeder → Substation
       - CGMES/Transmission: Equipment → Bay → VoltageLevel → Substation
       - CGMES direct VL: Equipment → VoltageLevel → Substation
+      - Auxiliary: AuxiliaryEquipment via Terminal → ConductingEquipment in substation
+      - Measurement: Measurement via Terminal → ConductingEquipment in substation
     Returns (eq, containerName) for each equipment node.
     """
     return f"""
@@ -221,6 +223,44 @@ def _substation_equipment_cte() -> str:
         WHERE any(lbl IN labels(eq) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
           AND NOT eq:{cim_label('Bay')}
         RETURN eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 5: AuxiliaryEquipment via Terminal → ConductingEquipment in substation
+        WITH s
+        MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+        MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+        MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+        MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
+        MATCH (aux)-[:`{cim_prop('AuxiliaryEquipment.Terminal')}`]->(t)
+        WHERE any(lbl IN labels(aux) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN aux AS eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 6: AuxiliaryEquipment via Terminal → ConductingEquipment in Feeders
+        WITH s
+        MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+        MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+        MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
+        MATCH (aux)-[:`{cim_prop('AuxiliaryEquipment.Terminal')}`]->(t)
+        WHERE any(lbl IN labels(aux) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN aux AS eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 7: Measurement nodes via Terminal → ConductingEquipment in substation
+        WITH s
+        MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+        MATCH (bay:{cim_label('Bay')})-[:`{cim_prop('Bay.VoltageLevel')}`]->(vl)
+        MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(bay)
+        MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
+        MATCH (m)-[:`{cim_prop('Measurement.Terminal')}`]->(t)
+        WHERE any(lbl IN labels(m) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN m AS eq, vl.`{cim_prop('IdentifiedObject.name')}` AS containerName
+      UNION
+        // Path 8: Measurement nodes via Terminal → ConductingEquipment in Feeders
+        WITH s
+        MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+        MATCH (ce)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
+        MATCH (t:{cim_label('Terminal')})-[:`{cim_prop('Terminal.ConductingEquipment')}`]->(ce)
+        MATCH (m)-[:`{cim_prop('Measurement.Terminal')}`]->(t)
+        WHERE any(lbl IN labels(m) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
+        RETURN m AS eq, f.`{cim_prop('IdentifiedObject.name')}` AS containerName
     }}
     """
 
