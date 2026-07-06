@@ -225,11 +225,34 @@ async def get_transformers(substation_name: str):
             cypher_substation_transformers(substation_name),
             {"substation_name": f"(?i).*{re.escape(substation_name)}.*"},
         )
+        # Raw rows are one-per-winding (a two-winding transformer appears twice).
+        # Also provide a grouped view — one entry per physical transformer with its
+        # windings nested — so LLM consumers count transformers, not windings.
+        grouped: dict = {}
+        for r in results:
+            key = r.get("transformer") or r.get("name")
+            g = grouped.setdefault(key, {
+                "transformer": r.get("transformer"),
+                "name": r.get("name"),
+                "containerName": r.get("containerName"),
+                "windings": [],
+            })
+            g["windings"].append({
+                "windingName": r.get("windingName"),
+                "ratedU": r.get("ratedU"),
+                "ratedS": r.get("ratedS"),
+                "connectionKind": r.get("connectionKind"),
+                "endNumber": r.get("endNumber"),
+                "baseVoltage": r.get("baseVoltage"),
+            })
+        transformers_grouped = sorted(grouped.values(), key=lambda g: g.get("name") or "")
         return {
             "success": True,
             "substation": substation_name,
             "result_count": len(results),
+            "transformer_count": len(transformers_grouped),
             "transformers": results,
+            "transformers_grouped": transformers_grouped,
         }
     except Exception as e:
         raise HTTPException(500, str(e))
