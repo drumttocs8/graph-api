@@ -40,6 +40,8 @@ from neo4j_client import (
     cypher_network_summary, cypher_enhanced_topology,
     cypher_substation_summary, cypher_substation_protection,
     cypher_substation_scada, cypher_substation_network,
+    cypher_cross_layer, cypher_protection_map, cypher_comms_path,
+    PROTOCOL_NAMES,
     NEO4J_URI,
 )
 
@@ -928,3 +930,179 @@ async def substation_briefing(substation_name: str):
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ── Cross-Layer Traversal ───────────────────────────────────────────────
+# Multi-dimensional questions are the point of the twin, and they were the slow
+# ones precisely because they had no endpoint. These follow the graph's own
+# cross-layer edges, so "what protects this, what polls it, how does it report
+# back" is one parameterised call rather than an agent-authored traversal.
+
+def _label_protocols(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """Rewrite raw edge types into protocol names an engineer would recognise."""
+    for row in rows:
+        val = row.get(key)
+        if isinstance(val, list):
+            row[key] = [PROTOCOL_NAMES.get(v, v) for v in val]
+        elif isinstance(val, str):
+            row[key] = PROTOCOL_NAMES.get(val, val)
+    return rows
+
+
+@app.get("/api/equipment/{equipment_name}/cross-layer")
+async def equipment_cross_layer(equipment_name: str):
+    """Every layer touching one device: electrical, protection, comms, telemetry.
+
+    The single most useful call for a cross-dimensional question — it answers
+    "tell me everything about this device" without the caller having to know
+    which layer holds which fact.
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_cross_layer(equipment_name),
+            {"equipment_name": f"(?i).*{re.escape(equipment_name)}.*"},
+        )
+        if not results:
+            raise HTTPException(404, f"Equipment '{equipment_name}' not found")
+        row = results[0]
+        _label_protocols(row.get("comms") or [], "link")
+        return {"success": True, **row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/protection-map")
+async def substation_protection_map(substation_name: str):
+    """Which relay protects which device, for a whole substation.
+
+    Follows the CIM ProtectedSwitch edge rather than guessing from naming.
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_protection_map(substation_name), _name_param(substation_name)
+        )
+        by_relay: Dict[str, List[str]] = {}
+        for r in results:
+            by_relay.setdefault(r.get("relay") or "unknown", []).append(r.get("protects"))
+        return {
+            "success": True,
+            "substation": substation_name,
+            "pair_count": len(results),
+            "relay_count": len(by_relay),
+            "pairs": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/equipment/{device_name}/comms-path")
+async def equipment_comms_path(device_name: str, max_hops: int = Query(4, ge=1, le=6)):
+    """Trace a device's communications path over the protocol-link edges.
+
+    Answers "how does this relay report back to the control centre" as a real
+    path — DNP3, SEL Mirrored Bits, ICCP, Modbus, Serial, Ethernet.
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_comms_path(device_name, max_hops),
+            {"device_name": f"(?i).*{re.escape(device_name)}.*"},
+        )
+        _label_protocols(results, "protocols")
+        return {
+            "success": True,
+            "device": device_name,
+            "path_count": len(results),
+            "paths": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Batch Composition ───────────────────────────────────────────────────
+# A compound question costs one agent turn per lookup, and each turn pays the
+# full prompt plus the model's reasoning. Batching lets the caller ask for
+# several endpoints at once; they run concurrently here and come back as one
+# payload, so a five-part question costs one round trip instead of five.
+
+class BatchRequest(BaseModel):
+    calls: List[str] = Field(
+        ...,
+        max_length=10,
+        description="Endpoint paths to fetch, e.g. ['api/substations/Annfield/protection']",
+    )
+
+
+# Path patterns the batch endpoint is allowed to dispatch to. Kept as an
+# explicit allowlist so batching can never reach a mutating route.
+_BATCH_ROUTES = [
+    (r"^api/substations/([^/]+)/summary$",          lambda m: substation_summary(m.group(1))),
+    (r"^api/substations/([^/]+)/protection$",       lambda m: substation_protection(m.group(1))),
+    (r"^api/substations/([^/]+)/protection-map$",   lambda m: substation_protection_map(m.group(1))),
+    (r"^api/substations/([^/]+)/scada$",            lambda m: substation_scada(m.group(1))),
+    (r"^api/substations/([^/]+)/network$",          lambda m: substation_network(m.group(1))),
+    (r"^api/substations/([^/]+)/briefing$",         lambda m: substation_briefing(m.group(1))),
+    (r"^api/substations/([^/]+)/equipment$",        lambda m: get_equipment(m.group(1))),
+    (r"^api/substations/([^/]+)/transformers$",     lambda m: get_transformers(m.group(1))),
+    (r"^api/substations/([^/]+)/breakers$",         lambda m: get_breakers(m.group(1))),
+    (r"^api/substations/([^/]+)/feeders$",          lambda m: get_feeders(m.group(1))),
+    (r"^api/substations/([^/]+)/voltage-levels$",   lambda m: get_voltage_levels(m.group(1))),
+    (r"^api/substations/([^/]+)/topology$",         lambda m: get_topology(m.group(1))),
+    (r"^api/equipment/([^/]+)/cross-layer$",        lambda m: equipment_cross_layer(m.group(1))),
+    (r"^api/equipment/([^/]+)/comms-path$",         lambda m: equipment_comms_path(m.group(1))),
+    (r"^api/equipment/([^/]+)/connected$",          lambda m: get_equipment_connected(m.group(1))),
+    (r"^api/equipment/([^/]+)/isolation-boundary$", lambda m: get_isolation_boundary(m.group(1))),
+    (r"^api/network-summary$",                      lambda m: network_summary()),
+    (r"^api/substations$",                          lambda m: list_substations_endpoint()),
+    (r"^api/stats$",                                lambda m: graph_stats()),
+]
+
+
+def _dispatch_batch(path: str):
+    """Resolve one batch path to its handler coroutine, or None if not allowed."""
+    cleaned = path.strip().lstrip("/").split("?")[0]
+    for pattern, factory in _BATCH_ROUTES:
+        match = re.match(pattern, cleaned)
+        if match:
+            return factory(match)
+    return None
+
+
+@app.post("/api/batch")
+async def batch(req: BatchRequest):
+    """Run several read-only endpoints concurrently and return them together.
+
+    Use this for any question that spans layers or substations. Asking for
+    protection, SCADA and comms in one batch costs the same wall time as the
+    slowest of the three, and one agent turn instead of three.
+    """
+    coros = []
+    paths = []
+    for path in req.calls:
+        coro = _dispatch_batch(path)
+        paths.append(path)
+        if coro is None:
+            async def _unknown(p=path):
+                return {"success": False, "error": f"'{p}' is not a batchable endpoint"}
+            coros.append(_unknown())
+        else:
+            coros.append(coro)
+
+    settled = await asyncio.gather(*coros, return_exceptions=True)
+
+    results: Dict[str, Any] = {}
+    for path, outcome in zip(paths, settled):
+        if isinstance(outcome, HTTPException):
+            results[path] = {"success": False, "error": outcome.detail}
+        elif isinstance(outcome, BaseException):
+            logger.error(f"Batch call '{path}' failed: {outcome}")
+            results[path] = {"success": False, "error": str(outcome)}
+        else:
+            results[path] = outcome
+
+    return {
+        "success": True,
+        "call_count": len(paths),
+        "results": results,
+    }

@@ -935,3 +935,162 @@ RETURN
   d.`{VER}protocol` AS protocol
 ORDER BY deviceType, name
 """
+
+
+# ── Cross-Layer Traversal ───────────────────────────────────────────────
+# The graph carries first-class edges between layers — a relay is joined to the
+# switch it protects by `cim__ProtectionEquipment.ProtectedSwitch`, and devices
+# are joined to their comms peers by the protocol-link edges. Multi-dimensional
+# questions are therefore short traversals, not the 8-path containment walks the
+# agent writes when left to author its own Cypher. These builders expose those
+# edges directly so a cross-layer question stays a single parameterised call.
+
+PROTOCOL_LINKS = [
+    "cim__DNP3Link", "cim__SELProtocolLink", "cim__ICCPLink",
+    "cim__ModbusLink", "cim__SerialLink", "cim__EthernetLink",
+]
+
+# Protocol edge type → the protocol name an engineer would actually say.
+PROTOCOL_NAMES = {
+    "cim__DNP3Link": "DNP3",
+    "cim__SELProtocolLink": "SEL Mirrored Bits",
+    "cim__ICCPLink": "ICCP",
+    "cim__ModbusLink": "Modbus",
+    "cim__SerialLink": "Serial",
+    "cim__EthernetLink": "Ethernet",
+}
+
+
+def _protocol_list() -> str:
+    return ", ".join(f"'{t}'" for t in PROTOCOL_LINKS)
+
+
+def _type_expr(var: str) -> str:
+    """Cypher fragment: strip the namespace prefix off a node's primary label."""
+    return (
+        f"[lbl IN labels({var}) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') "
+        f"AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0]"
+    )
+
+
+def cypher_cross_layer(equipment_name: str) -> str:
+    """Cypher: every layer touching one device, in a single query.
+
+    Electrical neighbours, the relays protecting it, the SCADA devices that poll
+    it, the comms gear carrying that traffic, and its live telemetry — each from
+    the edge that actually models the relationship.
+    """
+    return f"""
+MATCH (e)
+WHERE e.`{cim_prop('IdentifiedObject.name')}` =~ $equipment_name
+  AND any(lbl IN labels(e) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource')
+WITH e LIMIT 1
+
+// ── Electrical: direct connectivity ───────────────────────────────────
+CALL {{
+    WITH e
+    OPTIONAL MATCH (e)-[:CONNECTED_TO]-(n)
+    WHERE n <> e
+    RETURN collect(DISTINCT CASE WHEN n IS NULL THEN null ELSE {{
+        name: n.`{cim_prop('IdentifiedObject.name')}`,
+        type: {_type_expr('n')}
+    }} END) AS electricalRaw
+}}
+
+// ── Protection: relays bound to this device (edge points either way) ───
+CALL {{
+    WITH e
+    OPTIONAL MATCH (r)-[:`{cim_prop('ProtectionEquipment.ProtectedSwitch')}`]-(e)
+    OPTIONAL MATCH (r)-[:`{VER}HAS_DEVICE_MODEL`]->(rdm)
+    RETURN collect(DISTINCT CASE WHEN r IS NULL THEN null ELSE {{
+        name: r.`{cim_prop('IdentifiedObject.name')}`,
+        type: {_type_expr('r')},
+        model: coalesce(rdm.`{VER}model_number`, r.`{VER}relay_model`, r.`scada__RELAY_MODEL`),
+        ansiFunctions: r.`{VER}ansi_functions`,
+        commStatus: r.`scada__COMM_STATUS`
+    }} END) AS protectionRaw
+}}
+
+// ── Comms: peers one protocol hop away, labelled with the protocol ─────
+CALL {{
+    WITH e
+    OPTIONAL MATCH (e)-[l]-(peer)
+    WHERE type(l) IN [{_protocol_list()}] AND peer <> e
+    RETURN collect(DISTINCT CASE WHEN peer IS NULL THEN null ELSE {{
+        name: coalesce(peer.`{cim_prop('IdentifiedObject.name')}`, peer.`{VER}name`),
+        type: {_type_expr('peer')},
+        link: type(l),
+        ipAddress: coalesce(peer.`{VER}ip_address`, peer.`{VER}ipAddress`)
+    }} END) AS commsRaw
+}}
+
+RETURN
+  e.`{cim_prop('IdentifiedObject.name')}` AS equipment,
+  {_type_expr('e')} AS equipmentType,
+  e.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
+  e.`{VER}substationName` AS substation,
+  [x IN electricalRaw WHERE x IS NOT NULL] AS electrical,
+  [x IN protectionRaw WHERE x IS NOT NULL] AS protection,
+  [x IN commsRaw WHERE x IS NOT NULL] AS comms,
+  [k IN keys(e) WHERE k STARTS WITH 'scada__' | {{point: replace(k, 'scada__', ''), value: e[k]}}] AS telemetry
+"""
+
+
+def cypher_protection_map(substation_name: str) -> str:
+    """Cypher: which relay protects which device, across a whole substation.
+
+    Answers "what protects what here" in one call, following the CIM
+    ProtectedSwitch edge rather than inferring from names.
+    """
+    return f"""
+MATCH (r)-[:`{cim_prop('ProtectionEquipment.ProtectedSwitch')}`]-(sw)
+WHERE any(lbl IN labels(r) WHERE lbl CONTAINS 'ProtectiveRelay' OR lbl CONTAINS 'ProtectionEquipment')
+  AND (
+    r.`{VER}substationName` =~ $substation_name
+    OR sw.`{VER}substationName` =~ $substation_name
+    OR EXISTS {{
+        MATCH (sw)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(c)
+        WHERE c.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+    }}
+  )
+OPTIONAL MATCH (r)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
+RETURN
+  r.`{cim_prop('IdentifiedObject.name')}` AS relay,
+  coalesce(dm.`{VER}model_number`, r.`{VER}relay_model`, r.`scada__RELAY_MODEL`) AS relayModel,
+  r.`{VER}ansi_functions` AS ansiFunctions,
+  sw.`{cim_prop('IdentifiedObject.name')}` AS protects,
+  {_type_expr('sw')} AS protectsType,
+  r.`scada__COMM_STATUS` AS commStatus
+ORDER BY relay, protects
+"""
+
+
+def cypher_comms_path(device_name: str, max_hops: int = 4) -> str:
+    """Cypher: follow protocol links outward from a device to trace its comms path.
+
+    "How does this relay report back to the control centre" — the answer is a
+    path over DNP3/SEL/ICCP/Ethernet/Serial edges, which the graph models
+    explicitly.
+    """
+    hops = max(1, min(int(max_hops), 6))
+    return f"""
+MATCH (start)
+WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $device_name
+  AND any(lbl IN labels(start) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource')
+WITH start LIMIT 1
+MATCH path = (start)-[links*1..{hops}]-(endpoint)
+WHERE all(l IN links WHERE type(l) IN [{_protocol_list()}])
+  AND endpoint <> start
+WITH start, path, endpoint, links,
+     [n IN nodes(path) | coalesce(n.`{cim_prop('IdentifiedObject.name')}`, n.`{VER}name`)] AS hopNames,
+     [n IN nodes(path) | {_type_expr('n')}] AS hopTypes,
+     [l IN links | type(l)] AS linkTypes
+RETURN DISTINCT
+  hopNames AS hops,
+  hopTypes AS hopTypes,
+  linkTypes AS protocols,
+  size(links) AS hopCount,
+  {_type_expr('endpoint')} AS endpointType
+ORDER BY hopCount, endpointType
+LIMIT 50
+"""
