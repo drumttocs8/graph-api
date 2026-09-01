@@ -815,7 +815,11 @@ def _apply_telemetry(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in rows:
         pairs = row.pop("scadaPairs", None) or []
         props = {k: v for k, v in pairs if v is not None}
-        row["telemetry"] = extract_telemetry(props)
+        row["telemetry"] = extract_telemetry(
+            props,
+            device_name=row.get("name") or row.get("equipment"),
+            mrid=row.get("mrid"),
+        )
     return rows
 
 

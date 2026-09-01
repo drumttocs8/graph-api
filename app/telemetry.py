@@ -114,7 +114,11 @@ def _coerce_epoch(value: Any) -> Optional[datetime]:
     return None
 
 
-def extract_telemetry(props: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def extract_telemetry(
+    props: Optional[Dict[str, Any]],
+    device_name: Optional[str] = None,
+    mrid: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Build the standard telemetry block from a node's raw properties.
 
     Returns None when the device carries no telemetry at all — which callers
@@ -182,7 +186,58 @@ def extract_telemetry(props: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
         block["poll_cycle"] = scada["poll_cycle"]
     if scada.get("DEVICE_TYPE") is not None:
         block["device_type"] = scada["DEVICE_TYPE"]
+
+    block["headline"] = _headline(device_name, block)
+    block["rendered"] = _render_markdown(device_name, block)
+    if chart_fields and mrid:
+        title = f"{device_name} Telemetry" if device_name else "Telemetry"
+        block["chart_marker"] = (
+            f"[SCADA_CHART:{mrid}|{','.join(chart_fields)}|{title}]"
+        )
     return block
+
+
+def _headline(device_name: Optional[str], block: Dict[str, Any]) -> str:
+    """One line stating whose values these are and how current they are."""
+    who = f"**{device_name}**" if device_name else "Device"
+    when = block.get("updated_at") or "unknown time"
+    observed = _coerce_epoch(block.get("updated_at"))
+    if observed is not None:
+        when = observed.strftime("%Y-%m-%d %H:%M UTC")
+    if block.get("stale"):
+        return f"{who} — last known values, as of {when} (feed is not currently updating)"
+    return f"{who} — live values, as of {when}"
+
+
+_SECTIONS = [
+    ("analog", "Measurements"),
+    ("status", "Status"),
+    ("settings", "Settings (configured, not measured)"),
+    ("counters", "Counters"),
+]
+
+
+def _render_markdown(device_name: Optional[str], block: Dict[str, Any]) -> str:
+    """Ready-to-paste markdown for this device's telemetry.
+
+    Emitted so a caller never has to assemble the table itself — which is where
+    the value column tends to go missing.
+    """
+    parts: List[str] = [block["headline"], ""]
+    for key, title in _SECTIONS:
+        rows = block.get(key) or []
+        if not rows:
+            continue
+        parts.append(f"**{title}**")
+        parts.append("")
+        parts.append("| Point | Description | Value | Unit |")
+        parts.append("| :--- | :--- | ---: | :--- |")
+        for e in rows:
+            parts.append(
+                f"| `{e['point']}` | {e['label']} | {e['value']} | {e.get('unit', '')} |"
+            )
+        parts.append("")
+    return "\n".join(parts).strip()
 
 
 def attach_telemetry(row: Dict[str, Any], props_key: str = "scadaProps") -> Dict[str, Any]:
