@@ -15,6 +15,7 @@ Features:
 import os
 import json
 import re
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -37,6 +38,8 @@ from neo4j_client import (
     cypher_connected_equipment,
     cypher_equipment_connected, cypher_isolation_boundary,
     cypher_network_summary, cypher_enhanced_topology,
+    cypher_substation_summary, cypher_substation_protection,
+    cypher_substation_scada, cypher_substation_network,
     NEO4J_URI,
 )
 
@@ -789,5 +792,139 @@ async def find_path(
             "success": False,
             "message": f"No path found between '{from_equipment}' and '{to_equipment}' within {max_hops} hops",
         }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ── Chat Shortcuts ──────────────────────────────────────────────────────
+# Single-call answers for the question shapes the chat agent used to answer by
+# authoring multi-hop Cypher at runtime. Cypher authoring is where the agent's
+# latency lives (measured: 2-4s when a pre-built endpoint exists, 8-65s when
+# the agent has to write the query itself), so every shortcut added here moves
+# a class of question onto the fast path.
+
+def _name_param(substation_name: str) -> Dict[str, Any]:
+    """Case-insensitive substring match, consistent with the other endpoints."""
+    return {"substation_name": f"(?i).*{re.escape(substation_name)}.*"}
+
+
+@app.get("/api/substations/{substation_name}/summary")
+async def substation_summary(substation_name: str):
+    """One-shot substation profile: equipment counts by type, voltage levels, feeders.
+
+    Replaces the 2-3 separate calls the agent otherwise makes to answer
+    "what is this facility" / "how many X and Y are there".
+    """
+    try:
+        results = await execute_cypher_async(
+            cypher_substation_summary(substation_name), _name_param(substation_name)
+        )
+        if not results:
+            raise HTTPException(404, f"Substation '{substation_name}' not found")
+        return {"success": True, **results[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/protection")
+async def substation_protection(substation_name: str):
+    """Protection layer: relays with device model, manufacturer, ANSI functions, telemetry."""
+    try:
+        results = await execute_cypher_async(
+            cypher_substation_protection(substation_name), _name_param(substation_name)
+        )
+        by_model: Dict[str, int] = {}
+        for r in results:
+            key = r.get("model") or "unknown"
+            by_model[key] = by_model.get(key, 0) + 1
+        return {
+            "success": True,
+            "substation": substation_name,
+            "relay_count": len(results),
+            "by_model": by_model,
+            "relays": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/scada")
+async def substation_scada(substation_name: str):
+    """SCADA/control layer: RTUs, gateways, HMIs, historians, plant controllers."""
+    try:
+        results = await execute_cypher_async(
+            cypher_substation_scada(substation_name), _name_param(substation_name)
+        )
+        by_type: Dict[str, int] = {}
+        for r in results:
+            key = r.get("deviceType") or "unknown"
+            by_type[key] = by_type.get(key, 0) + 1
+        return {
+            "success": True,
+            "substation": substation_name,
+            "device_count": len(results),
+            "by_type": by_type,
+            "devices": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/network")
+async def substation_network(substation_name: str):
+    """Communications layer: switches, routers, port servers and their addressing."""
+    try:
+        results = await execute_cypher_async(
+            cypher_substation_network(substation_name), _name_param(substation_name)
+        )
+        return {
+            "success": True,
+            "substation": substation_name,
+            "device_count": len(results),
+            "devices": results,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/substations/{substation_name}/briefing")
+async def substation_briefing(substation_name: str):
+    """All four layers in one call — electrical, protection, SCADA, communications.
+
+    This is the "walk me through this substation" answer. The four queries run
+    concurrently, so the endpoint costs about as much as its slowest layer
+    rather than the sum, and it collapses what was a 5-tool-call agent loop
+    into a single round trip.
+    """
+    params = _name_param(substation_name)
+    try:
+        summary, protection, scada, network = await asyncio.gather(
+            execute_cypher_async(cypher_substation_summary(substation_name), params),
+            execute_cypher_async(cypher_substation_protection(substation_name), params),
+            execute_cypher_async(cypher_substation_scada(substation_name), params),
+            execute_cypher_async(cypher_substation_network(substation_name), params),
+        )
+        if not summary:
+            raise HTTPException(404, f"Substation '{substation_name}' not found")
+        return {
+            "success": True,
+            "electrical": summary[0],
+            "protection": {
+                "relay_count": len(protection),
+                "relays": protection,
+            },
+            "scada": {
+                "device_count": len(scada),
+                "devices": scada,
+            },
+            "network": {
+                "device_count": len(network),
+                "devices": network,
+            },
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))

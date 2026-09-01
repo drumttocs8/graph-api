@@ -772,3 +772,166 @@ RETURN DISTINCT
   eq2.`{cim_prop('IdentifiedObject.mRID')}` AS eq2MRID
 ORDER BY eq1Name, eq2Name
 """
+
+
+# ── Demo/Latency Shortcuts ──────────────────────────────────────────────
+# These collapse question shapes that previously forced the chat agent to
+# author multi-hop Cypher at runtime (measured 8-65s) into a single
+# pre-built endpoint call (measured 2-4s). See ROADMAP "chat latency".
+#
+# Scoping note: secondary-system devices (relays, RTUs, network gear) carry a
+# denormalised `ns1__substationName` property, so they can be scoped directly
+# without walking the 8-path containment CTE. Where that property is absent we
+# fall back to the containment CTE.
+
+
+def _ver_devices_by_substation(labels: List[str]) -> str:
+    """Subquery: find ns1__/cim__ secondary-system devices belonging to a substation.
+
+    Matches on the denormalised `ns1__substationName` property first (fast path),
+    then unions the containment CTE result for devices that lack it.
+    """
+    label_list = ", ".join(f"'{lbl}'" for lbl in labels)
+    return f"""
+    CALL {{
+        // Fast path: denormalised substation name on the device itself
+        WITH s
+        MATCH (d)
+        WHERE any(lbl IN labels(d) WHERE lbl IN [{label_list}])
+          AND d.`{VER}substationName` = s.`{cim_prop('IdentifiedObject.name')}`
+        RETURN d
+      UNION
+        // Fallback: devices reachable through CIM containment
+        WITH s
+        {_substation_equipment_cte()}
+        WITH eq AS d
+        WHERE any(lbl IN labels(d) WHERE lbl IN [{label_list}])
+        RETURN d
+    }}
+    """
+
+
+def cypher_substation_summary(substation_name: str) -> str:
+    """Cypher: one-shot substation profile — counts by type across all layers.
+
+    Answers "what is this facility / what's in it / how many X and Y" without
+    the agent having to author a query or make several calls.
+    """
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+{_substation_equipment_cte()}
+WITH s, eq
+WITH s,
+     [lbl IN labels(eq) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
+        AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0] AS type,
+     eq
+WHERE type IS NOT NULL
+WITH s, type, count(DISTINCT eq) AS n
+ORDER BY n DESC, type
+WITH s, collect({{type: type, count: n}}) AS byType, sum(n) AS totalEquipment
+OPTIONAL MATCH (vl:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Substation')}`]->(s)
+OPTIONAL MATCH (vl)-[:`{cim_prop('VoltageLevel.BaseVoltage')}`]->(bv)
+WITH s, byType, totalEquipment,
+     collect(DISTINCT bv.`{cim_prop('BaseVoltage.nominalVoltage')}`) AS kvRaw
+OPTIONAL MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
+RETURN
+  s.`{cim_prop('IdentifiedObject.name')}` AS substation,
+  s.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
+  totalEquipment,
+  byType,
+  [v IN kvRaw WHERE v IS NOT NULL] AS voltageLevelsKV,
+  count(DISTINCT f) AS feederCount
+"""
+
+
+def cypher_substation_protection(substation_name: str) -> str:
+    """Cypher: the protection layer — relays, models, ANSI functions, live telemetry.
+
+    Replaces the agent-authored protection queries that measured 8-65s.
+    """
+    relay_labels = [cim_label("ProtectiveRelay"), f"{VER}ProtectiveRelay"]
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+{_ver_devices_by_substation(relay_labels)}
+WITH DISTINCT d AS r
+OPTIONAL MATCH (r)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
+OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+OPTIONAL MATCH (dm)-[:`{VER}SUPPORTS_FUNCTION`]->(fn)
+WITH r, dm, mfr,
+     collect(DISTINCT CASE WHEN fn IS NULL THEN null ELSE
+        {{code: fn.`{VER}code`, name: fn.`{VER}name`}} END) AS fns
+RETURN
+  r.`{cim_prop('IdentifiedObject.name')}` AS name,
+  r.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
+  coalesce(dm.`{VER}model_number`, r.`{VER}relay_model`, r.`scada__RELAY_MODEL`) AS model,
+  coalesce(mfr.`{VER}name`, mfr.`{cim_prop('IdentifiedObject.name')}`) AS manufacturer,
+  dm.`{VER}description` AS modelDescription,
+  [f IN fns WHERE f IS NOT NULL | f.code] AS ansiFunctions,
+  r.`{VER}ansi_functions` AS ansiFunctionsRaw,
+  r.`scada__COMM_STATUS` AS commStatus,
+  r.`scada__TRIP` AS trip,
+  r.`scada__TARGET` AS target,
+  r.`scada__52A` AS breakerStatus,
+  r.`scada__updated_at` AS telemetryUpdatedAt
+ORDER BY model, name
+"""
+
+
+def cypher_substation_scada(substation_name: str) -> str:
+    """Cypher: the SCADA/control layer — RTUs, gateways, HMIs, historians, controllers."""
+    scada_labels = [
+        f"{VER}RemoteUnit", f"{VER}ControlCenter", f"{VER}HMI", f"{VER}Historian",
+        f"{VER}PPC", f"{VER}BESSController", f"{VER}PortServer",
+        cim_label("RemoteUnit"), cim_label("PortServer"),
+    ]
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+{_ver_devices_by_substation(scada_labels)}
+WITH DISTINCT d
+OPTIONAL MATCH (d)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
+OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+RETURN
+  coalesce(d.`{cim_prop('IdentifiedObject.name')}`, d.`{VER}name`) AS name,
+  [lbl IN labels(d) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
+     AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0] AS deviceType,
+  dm.`{VER}model_number` AS model,
+  coalesce(mfr.`{VER}name`, mfr.`{cim_prop('IdentifiedObject.name')}`) AS manufacturer,
+  dm.`{VER}description` AS modelDescription,
+  coalesce(d.`{VER}ip_address`, d.`{VER}ipAddress`, d.`{VER}RemoteUnit.ipAddress`) AS ipAddress,
+  d.`{VER}protocol` AS protocol,
+  d.`scada__COMM_STATUS` AS commStatus
+ORDER BY deviceType, name
+"""
+
+
+def cypher_substation_network(substation_name: str) -> str:
+    """Cypher: the communications layer — switches, routers, port servers, addressing."""
+    net_labels = [
+        cim_label("NetworkSwitch"), cim_label("Router"), cim_label("PortServer"),
+        cim_label("Firewall"), f"{VER}NetworkSwitch", f"{VER}Router",
+        f"{VER}PortServer", f"{VER}Firewall",
+    ]
+    return f"""
+MATCH (s:{cim_label('Substation')})
+WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
+WITH s
+{_ver_devices_by_substation(net_labels)}
+WITH DISTINCT d
+OPTIONAL MATCH (d)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
+OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+RETURN
+  coalesce(d.`{cim_prop('IdentifiedObject.name')}`, d.`{VER}name`) AS name,
+  [lbl IN labels(d) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
+     AND lbl <> 'Resource' | replace(replace(lbl, '{CIM}', ''), '{VER}', '')][0] AS deviceType,
+  dm.`{VER}model_number` AS model,
+  coalesce(mfr.`{VER}name`, mfr.`{cim_prop('IdentifiedObject.name')}`) AS manufacturer,
+  coalesce(d.`{VER}ip_address`, d.`{VER}ipAddress`) AS ipAddress,
+  d.`{VER}protocol` AS protocol
+ORDER BY deviceType, name
+"""
