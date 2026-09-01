@@ -817,7 +817,7 @@ def _apply_telemetry(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         props = {k: v for k, v in pairs if v is not None}
         row["telemetry"] = extract_telemetry(
             props,
-            device_name=row.get("name") or row.get("equipment"),
+            device_name=row.get("name") or row.get("relay") or row.get("equipment"),
             mrid=row.get("mrid"),
         )
     return rows
@@ -984,6 +984,10 @@ async def equipment_cross_layer(equipment_name: str):
         if not results:
             raise HTTPException(404, f"Equipment '{equipment_name}' not found")
         row = _apply_telemetry(results)[0]
+        # The relays reached from this device carry their own telemetry — a
+        # "what protects T3" answer should be able to show the 87T values.
+        for key in ("protection", "protectionViaSwitchgear"):
+            _apply_telemetry(row.get(key) or [])
         _label_protocols(row.get("comms") or [], "link")
         return {"success": True, **row}
     except HTTPException:

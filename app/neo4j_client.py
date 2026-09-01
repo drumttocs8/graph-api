@@ -1049,7 +1049,8 @@ CALL {{
         type: {_type_expr('r')},
         model: coalesce(rdm.`{VER}model_number`, r.`{VER}relay_model`, r.`scada__RELAY_MODEL`),
         ansiFunctions: r.`{VER}ansi_functions`,
-        commStatus: r.`scada__COMM_STATUS`
+        mrid: r.`{cim_prop('IdentifiedObject.mRID')}`,
+        scadaPairs: [k IN keys(r) WHERE k STARTS WITH 'scada__' | [k, r[k]]]
     }} END) AS protectionRaw
 }}
 
@@ -1071,7 +1072,8 @@ CALL {{
         model: coalesce(r2dm.`{VER}model_number`, r2.`{VER}relay_model`, r2.`scada__RELAY_MODEL`),
         ansiFunctions: r2.`{VER}ansi_functions`,
         viaSwitch: sw.`{cim_prop('IdentifiedObject.name')}`,
-        commStatus: r2.`scada__COMM_STATUS`
+        mrid: r2.`{cim_prop('IdentifiedObject.mRID')}`,
+        scadaPairs: [k IN keys(r2) WHERE k STARTS WITH 'scada__' | [k, r2[k]]]
     }} END) AS indirectRaw
 }}
 
