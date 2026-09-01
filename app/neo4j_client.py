@@ -1100,8 +1100,14 @@ def cypher_comms_path(device_name: str, max_hops: int = 4) -> str:
     "How does this relay report back to the control centre" — the answer is a
     path over DNP3/SEL/ICCP/Ethernet/Serial edges, which the graph models
     explicitly.
+
+    Uses shortestPath rather than a variable-length walk: an unbounded walk over
+    a densely linked comms segment returns hundreds of near-duplicate paths (one
+    per ordering), which was both slow and unreadable. shortestPath yields one
+    path per reachable endpoint, which is the answer anyone actually wants.
     """
     hops = max(1, min(int(max_hops), 6))
+    alternation = "|".join(f"`{t}`" for t in PROTOCOL_LINKS)
     return f"""
 MATCH (start)
 WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $device_name
@@ -1109,19 +1115,20 @@ WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $device_name
 WITH start, {_name_match_rank('start', '$device_raw')} AS rank
 ORDER BY rank, start.`{cim_prop('IdentifiedObject.name')}`
 WITH start LIMIT 1
-MATCH path = (start)-[links*1..{hops}]-(endpoint)
-WHERE all(l IN links WHERE type(l) IN [{_protocol_list()}])
-  AND endpoint <> start
-WITH start, path, endpoint, links,
+
+MATCH path = shortestPath((start)-[:{alternation}*1..{hops}]-(endpoint))
+WHERE endpoint <> start
+WITH start, path, endpoint,
      [n IN nodes(path) | coalesce(n.`{cim_prop('IdentifiedObject.name')}`, n.`{VER}name`)] AS hopNames,
      [n IN nodes(path) | {_type_expr('n')}] AS hopTypes,
-     [l IN links | type(l)] AS linkTypes
-RETURN DISTINCT
-  hopNames AS hops,
-  hopTypes AS hopTypes,
-  linkTypes AS protocols,
-  size(links) AS hopCount,
+     [r IN relationships(path) | type(r)] AS linkTypes,
+     length(path) AS hopCount
+RETURN
+  hopNames    AS hops,
+  hopTypes    AS hopTypes,
+  linkTypes   AS protocols,
+  hopCount    AS hopCount,
   {_type_expr('endpoint')} AS endpointType
 ORDER BY hopCount, endpointType
-LIMIT 50
+LIMIT 25
 """
