@@ -973,6 +973,33 @@ def _type_expr(var: str) -> str:
     )
 
 
+# Nodes that borrow an equipment name into their own label text — limit sets,
+# diagram furniture, location points. A name lookup must never resolve to one.
+_NAME_MATCH_DENY = [
+    "OperationalLimitSet", "OperationalLimit", "CurrentLimit", "VoltageLimit",
+    "ApparentPowerLimit", "DiagramObject", "DiagramObjectPoint", "Location",
+    "PositionPoint", "CoordinateSystem", "TopologicalNode", "TopologicalIsland",
+    "BaseVoltage", "PSRType", "OperationalLimitType",
+]
+
+
+def _name_match_where(var: str) -> str:
+    """Cypher predicate: `var` is a real device whose name matches $name-style param."""
+    deny = " AND ".join(f"NOT {var}:`{CIM}{lbl}`" for lbl in _NAME_MATCH_DENY)
+    return f"""any(lbl IN labels({var}) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource')
+  AND {deny}"""
+
+
+def _name_match_rank(var: str, param: str) -> str:
+    """Cypher expression: 0 for an exact name, 1 for a prefix, 2 for anything else."""
+    name = f"{var}.`{cim_prop('IdentifiedObject.name')}`"
+    return f"""CASE
+       WHEN toLower({name}) = toLower({param}) THEN 0
+       WHEN toLower({name}) STARTS WITH toLower({param}) THEN 1
+       ELSE 2
+     END"""
+
+
 def cypher_cross_layer(equipment_name: str) -> str:
     """Cypher: every layer touching one device, in a single query.
 
@@ -983,7 +1010,9 @@ def cypher_cross_layer(equipment_name: str) -> str:
     return f"""
 MATCH (e)
 WHERE e.`{cim_prop('IdentifiedObject.name')}` =~ $equipment_name
-  AND any(lbl IN labels(e) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource')
+  AND {_name_match_where('e')}
+WITH e, {_name_match_rank('e', '$equipment_raw')} AS rank
+ORDER BY rank, e.`{cim_prop('IdentifiedObject.name')}`
 WITH e LIMIT 1
 
 // ── Electrical: direct connectivity ───────────────────────────────────
@@ -1076,7 +1105,9 @@ def cypher_comms_path(device_name: str, max_hops: int = 4) -> str:
     return f"""
 MATCH (start)
 WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $device_name
-  AND any(lbl IN labels(start) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}') AND lbl <> 'Resource')
+  AND {_name_match_where('start')}
+WITH start, {_name_match_rank('start', '$device_raw')} AS rank
+ORDER BY rank, start.`{cim_prop('IdentifiedObject.name')}`
 WITH start LIMIT 1
 MATCH path = (start)-[links*1..{hops}]-(endpoint)
 WHERE all(l IN links WHERE type(l) IN [{_protocol_list()}])

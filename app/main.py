@@ -960,7 +960,8 @@ async def equipment_cross_layer(equipment_name: str):
     try:
         results = await execute_cypher_async(
             cypher_cross_layer(equipment_name),
-            {"equipment_name": f"(?i).*{re.escape(equipment_name)}.*"},
+            {"equipment_name": f"(?i).*{re.escape(equipment_name)}.*",
+             "equipment_raw": equipment_name},
         )
         if not results:
             raise HTTPException(404, f"Equipment '{equipment_name}' not found")
@@ -1007,7 +1008,8 @@ async def equipment_comms_path(device_name: str, max_hops: int = Query(4, ge=1, 
     try:
         results = await execute_cypher_async(
             cypher_comms_path(device_name, max_hops),
-            {"device_name": f"(?i).*{re.escape(device_name)}.*"},
+            {"device_name": f"(?i).*{re.escape(device_name)}.*",
+             "device_raw": device_name},
         )
         _label_protocols(results, "protocols")
         return {
