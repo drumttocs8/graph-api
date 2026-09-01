@@ -980,6 +980,12 @@ _NAME_MATCH_DENY = [
     "ApparentPowerLimit", "DiagramObject", "DiagramObjectPoint", "Location",
     "PositionPoint", "CoordinateSystem", "TopologicalNode", "TopologicalIsland",
     "BaseVoltage", "PSRType", "OperationalLimitType",
+    # Sub-components that carry their parent's name — "T3" means the
+    # transformer, not its tap changer or one of its winding ends. Each is
+    # still reachable through the transformer endpoints.
+    "RatioTapChanger", "PhaseTapChanger", "TapChanger", "TapChangerControl",
+    "TransformerEnd", "PowerTransformerEnd", "TransformerMeshImpedance",
+    "TransformerCoreAdmittance", "RegulatingControl",
 ]
 
 
@@ -1000,6 +1006,17 @@ def _name_match_rank(var: str, param: str) -> str:
      END"""
 
 
+def _name_match_tier(var: str) -> str:
+    """Cypher expression: 0 if `var` is real contained equipment, else 1.
+
+    Breaks ties between same-named nodes — the device that sits in an equipment
+    container is the one an engineer means.
+    """
+    return f"""CASE WHEN EXISTS {{
+       MATCH ({var})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->()
+     }} THEN 0 ELSE 1 END"""
+
+
 def cypher_cross_layer(equipment_name: str) -> str:
     """Cypher: every layer touching one device, in a single query.
 
@@ -1011,8 +1028,8 @@ def cypher_cross_layer(equipment_name: str) -> str:
 MATCH (e)
 WHERE e.`{cim_prop('IdentifiedObject.name')}` =~ $equipment_name
   AND {_name_match_where('e')}
-WITH e, {_name_match_rank('e', '$equipment_raw')} AS rank
-ORDER BY rank, e.`{cim_prop('IdentifiedObject.name')}`
+WITH e, {_name_match_rank('e', '$equipment_raw')} AS rank, {_name_match_tier('e')} AS tier
+ORDER BY rank, tier, e.`{cim_prop('IdentifiedObject.name')}`
 WITH e LIMIT 1
 
 // ── Electrical: direct connectivity ───────────────────────────────────
@@ -1112,8 +1129,8 @@ def cypher_comms_path(device_name: str, max_hops: int = 4) -> str:
 MATCH (start)
 WHERE start.`{cim_prop('IdentifiedObject.name')}` =~ $device_name
   AND {_name_match_where('start')}
-WITH start, {_name_match_rank('start', '$device_raw')} AS rank
-ORDER BY rank, start.`{cim_prop('IdentifiedObject.name')}`
+WITH start, {_name_match_rank('start', '$device_raw')} AS rank, {_name_match_tier('start')} AS tier
+ORDER BY rank, tier, start.`{cim_prop('IdentifiedObject.name')}`
 WITH start LIMIT 1
 
 MATCH path = shortestPath((start)-[:{alternation}*1..{hops}]-(endpoint))
