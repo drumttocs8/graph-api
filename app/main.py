@@ -1012,6 +1012,13 @@ async def equipment_comms_path(device_name: str, max_hops: int = Query(4, ge=1, 
              "device_raw": device_name},
         )
         _label_protocols(results, "protocols")
+        # The route string embeds raw edge types; relabel those too.
+        for row in results:
+            route = row.get("route")
+            if isinstance(route, str):
+                for edge, friendly in PROTOCOL_NAMES.items():
+                    route = route.replace(edge, friendly)
+                row["route"] = route
         return {
             "success": True,
             "device": device_name,

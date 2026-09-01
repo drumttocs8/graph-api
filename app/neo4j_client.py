@@ -1135,17 +1135,27 @@ WITH start LIMIT 1
 
 MATCH path = shortestPath((start)-[:{alternation}*1..{hops}]-(endpoint))
 WHERE endpoint <> start
-WITH start, path, endpoint,
+WITH path, endpoint,
      [n IN nodes(path) | coalesce(n.`{cim_prop('IdentifiedObject.name')}`, n.`{VER}name`)] AS hopNames,
      [n IN nodes(path) | {_type_expr('n')}] AS hopTypes,
      [r IN relationships(path) | type(r)] AS linkTypes,
-     length(path) AS hopCount
-RETURN
-  hopNames    AS hops,
-  hopTypes    AS hopTypes,
-  linkTypes   AS protocols,
-  hopCount    AS hopCount,
-  {_type_expr('endpoint')} AS endpointType
-ORDER BY hopCount, endpointType
-LIMIT 25
+     length(path) AS hopCount,
+     {_type_expr('endpoint')} AS endpointType
+
+// Render the path as one readable line rather than three parallel arrays —
+// far fewer tokens for a caller to read, and already in the shape of an answer.
+WITH hopCount, endpointType, linkTypes,
+     reduce(acc = '', i IN range(0, size(hopNames) - 1) |
+       acc
+       + CASE WHEN i = 0 THEN '' ELSE ' --[' + linkTypes[i - 1] + ']--> ' END
+       + coalesce(hopNames[i], '?') + ' (' + coalesce(hopTypes[i], '?') + ')'
+     ) AS route
+
+// A "how does this report back" question means the control centre, the
+// historian or the HMI — surface those destinations before intermediate hops.
+WITH route, hopCount, endpointType, linkTypes,
+     CASE WHEN endpointType IN ['ControlCenter', 'Historian', 'HMI'] THEN 0 ELSE 1 END AS destRank
+RETURN route, hopCount, endpointType, linkTypes AS protocols
+ORDER BY destRank, hopCount, endpointType
+LIMIT 12
 """
