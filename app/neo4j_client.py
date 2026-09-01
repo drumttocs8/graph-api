@@ -1057,6 +1057,39 @@ CALL {{
     }} END) AS protectionRaw
 }}
 
+// ── Protection, indirectly: relays on the adjacent switchgear ─────────
+// CIM binds a relay to the switch it trips, not to the transformer or busbar
+// behind it. "What protects T3" therefore means "what protects the breakers
+// either side of T3", which is one more hop.
+CALL {{
+    WITH e
+    OPTIONAL MATCH (e)-[:CONNECTED_TO]-(sw)
+    WHERE any(lbl IN labels(sw) WHERE lbl IN [
+        '{cim_label('Breaker')}', '{cim_label('Disconnector')}',
+        '{cim_label('LoadBreakSwitch')}', '{cim_label('Recloser')}'
+    ])
+    OPTIONAL MATCH (r2)-[:`{cim_prop('ProtectionEquipment.ProtectedSwitch')}`]-(sw)
+    OPTIONAL MATCH (r2)-[:`{VER}HAS_DEVICE_MODEL`]->(r2dm)
+    RETURN collect(DISTINCT CASE WHEN r2 IS NULL THEN null ELSE {{
+        relay: r2.`{cim_prop('IdentifiedObject.name')}`,
+        model: coalesce(r2dm.`{VER}model_number`, r2.`{VER}relay_model`, r2.`scada__RELAY_MODEL`),
+        ansiFunctions: r2.`{VER}ansi_functions`,
+        viaSwitch: sw.`{cim_prop('IdentifiedObject.name')}`,
+        commStatus: r2.`scada__COMM_STATUS`
+    }} END) AS indirectRaw
+}}
+
+// ── Containing substation, when the device does not carry the name ─────
+CALL {{
+    WITH e
+    OPTIONAL MATCH (e)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(c)
+    OPTIONAL MATCH (c)-[:`{cim_prop('VoltageLevel.Substation')}`|`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(sub)
+    RETURN coalesce(
+        sub.`{cim_prop('IdentifiedObject.name')}`,
+        c.`{cim_prop('IdentifiedObject.name')}`
+    ) AS containerName
+}}
+
 // ── Comms: peers one protocol hop away, labelled with the protocol ─────
 CALL {{
     WITH e
@@ -1074,9 +1107,10 @@ RETURN
   e.`{cim_prop('IdentifiedObject.name')}` AS equipment,
   {_type_expr('e')} AS equipmentType,
   e.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
-  e.`{VER}substationName` AS substation,
+  coalesce(e.`{VER}substationName`, containerName) AS substation,
   [x IN electricalRaw WHERE x IS NOT NULL] AS electrical,
   [x IN protectionRaw WHERE x IS NOT NULL] AS protection,
+  [x IN indirectRaw WHERE x IS NOT NULL] AS protectionViaSwitchgear,
   [x IN commsRaw WHERE x IS NOT NULL] AS comms,
   [k IN keys(e) WHERE k STARTS WITH 'scada__' | {{point: replace(k, 'scada__', ''), value: e[k]}}] AS telemetry
 """
