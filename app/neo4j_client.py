@@ -872,11 +872,7 @@ RETURN
   dm.`{VER}description` AS modelDescription,
   [f IN fns WHERE f IS NOT NULL | f.code] AS ansiFunctions,
   r.`{VER}ansi_functions` AS ansiFunctionsRaw,
-  r.`scada__COMM_STATUS` AS commStatus,
-  r.`scada__TRIP` AS trip,
-  r.`scada__TARGET` AS target,
-  r.`scada__52A` AS breakerStatus,
-  r.`scada__updated_at` AS telemetryUpdatedAt
+  [k IN keys(r) WHERE k STARTS WITH 'scada__' | [k, r[k]]] AS scadaPairs
 ORDER BY model, name
 """
 
@@ -905,7 +901,7 @@ RETURN
   dm.`{VER}description` AS modelDescription,
   coalesce(d.`{VER}ip_address`, d.`{VER}ipAddress`, d.`{VER}RemoteUnit.ipAddress`) AS ipAddress,
   d.`{VER}protocol` AS protocol,
-  d.`scada__COMM_STATUS` AS commStatus
+  [k IN keys(d) WHERE k STARTS WITH 'scada__' | [k, d[k]]] AS scadaPairs
 ORDER BY deviceType, name
 """
 
@@ -1112,7 +1108,7 @@ RETURN
   [x IN protectionRaw WHERE x IS NOT NULL] AS protection,
   [x IN indirectRaw WHERE x IS NOT NULL] AS protectionViaSwitchgear,
   [x IN commsRaw WHERE x IS NOT NULL] AS comms,
-  [k IN keys(e) WHERE k STARTS WITH 'scada__' | {{point: replace(k, 'scada__', ''), value: e[k]}}] AS telemetry
+  [k IN keys(e) WHERE k STARTS WITH 'scada__' | [k, e[k]]] AS scadaPairs
 """
 
 

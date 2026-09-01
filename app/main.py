@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from telemetry import extract_telemetry
 from neo4j_client import (
     get_async_driver, close_async_driver, execute_cypher_async, check_neo4j_async,
     cim_label, cim_prop, CIM,
@@ -805,6 +806,19 @@ async def find_path(
 # the agent has to write the query itself), so every shortcut added here moves
 # a class of question onto the fast path.
 
+def _apply_telemetry(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Turn each row's raw scada key/value pairs into the standard block.
+
+    Cypher cannot build a map from dynamic keys without apoc, so the query
+    returns pairs and the shaping happens here.
+    """
+    for row in rows:
+        pairs = row.pop("scadaPairs", None) or []
+        props = {k: v for k, v in pairs if v is not None}
+        row["telemetry"] = extract_telemetry(props)
+    return rows
+
+
 def _name_param(substation_name: str) -> Dict[str, Any]:
     """Case-insensitive substring match, consistent with the other endpoints."""
     return {"substation_name": f"(?i).*{re.escape(substation_name)}.*"}
@@ -834,9 +848,9 @@ async def substation_summary(substation_name: str):
 async def substation_protection(substation_name: str):
     """Protection layer: relays with device model, manufacturer, ANSI functions, telemetry."""
     try:
-        results = await execute_cypher_async(
+        results = _apply_telemetry(await execute_cypher_async(
             cypher_substation_protection(substation_name), _name_param(substation_name)
-        )
+        ))
         by_model: Dict[str, int] = {}
         for r in results:
             key = r.get("model") or "unknown"
@@ -856,9 +870,9 @@ async def substation_protection(substation_name: str):
 async def substation_scada(substation_name: str):
     """SCADA/control layer: RTUs, gateways, HMIs, historians, plant controllers."""
     try:
-        results = await execute_cypher_async(
+        results = _apply_telemetry(await execute_cypher_async(
             cypher_substation_scada(substation_name), _name_param(substation_name)
-        )
+        ))
         by_type: Dict[str, int] = {}
         for r in results:
             key = r.get("deviceType") or "unknown"
@@ -965,7 +979,7 @@ async def equipment_cross_layer(equipment_name: str):
         )
         if not results:
             raise HTTPException(404, f"Equipment '{equipment_name}' not found")
-        row = results[0]
+        row = _apply_telemetry(results)[0]
         _label_protocols(row.get("comms") or [], "link")
         return {"success": True, **row}
     except HTTPException:
