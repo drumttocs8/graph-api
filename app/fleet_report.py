@@ -64,25 +64,28 @@ def build_caveats(
     if not coverage:
         return caveats
 
+    # Every caveat below describes the whole graph, not the filtered result it
+    # is printed under. Saying so matters: "286 of 326 devices have no model"
+    # sitting beneath a table of 34 relays reads as a statement about those 34.
     resolution = coverage.get("siteResolution") or {}
     unresolved = resolution.get("unresolved") or 0
     if unresolved:
         caveats.append(
-            f"{unresolved} device(s) could not be tied to a site and are grouped "
-            f"under '{UNASSIGNED}'. They are counted in totals but not attributed "
-            "to any substation."
+            f"Fleet-wide: {unresolved} device(s) could not be tied to a site and are "
+            f"grouped under '{UNASSIGNED}'. They are counted in totals but not "
+            "attributed to any substation."
         )
 
     attrs = coverage.get("attributeCoverage") or {}
     total = coverage.get("totalDevices") or 0
-    for key, label in (("model", "a device model"),
-                       ("manufacturer", "a manufacturer"),
-                       ("firmware", "a firmware version")):
+    for key, label in (("model", "device model"),
+                       ("manufacturer", "manufacturer"),
+                       ("firmware", "firmware version")):
         have = attrs.get(key) or 0
         if total and have < total:
             caveats.append(
-                f"{total - have} of {total} devices have no {label} recorded; "
-                f"they appear as '{NOT_RECORDED}'."
+                f"Fleet-wide: {total - have} of {total} devices have no {label} "
+                f"recorded; where that applies they appear as '{NOT_RECORDED}'."
             )
 
     for entry in coverage.get("duplication") or []:
