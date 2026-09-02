@@ -592,7 +592,10 @@ CALL {{
     OPTIONAL MATCH (f:{cim_label('Feeder')})-[:`{cim_prop('Feeder.NormalEnergizingSubstation')}`]->(s)
     OPTIONAL MATCH (eq4)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(f)
     WHERE any(lbl IN labels(eq4) WHERE lbl STARTS WITH '{CIM}' AND lbl <> 'Resource')
-    WITH s, direct + vlEquip + bayEquip + collect(DISTINCT eq4) AS allEquip
+    // Collect the aggregation first, then combine. Neo4j 5.24+ rejects mixing an
+    // aggregation with grouping keys inside one expression.
+    WITH s, direct, vlEquip, bayEquip, collect(DISTINCT eq4) AS feederEquip
+    WITH s, direct + vlEquip + bayEquip + feederEquip AS allEquip
     UNWIND allEquip AS eq
     WITH DISTINCT s, eq
     WITH s, count(eq) AS totalEquipment,
@@ -603,7 +606,9 @@ CALL {{
          count(CASE WHEN eq:{cim_label('ACLineSegment')} THEN 1 END) AS lineSegments,
          count(CASE WHEN eq:{cim_label('EnergyConsumer')} THEN 1 END) AS loads,
          count(CASE WHEN eq:{cim_label('ProtectiveRelay')} THEN 1 END) AS protectionRelays
-    RETURN s, totalEquipment, breakers, disconnectors, transformers, busbars,
+    // Do NOT return `s` — it is imported from the outer scope, and returning it
+    // shadows the outer binding. Neo4j 5.24+ rejects that outright.
+    RETURN totalEquipment, breakers, disconnectors, transformers, busbars,
            lineSegments, loads, protectionRelays
 }}
 WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
@@ -629,9 +634,13 @@ OPTIONAL MATCH (vl2:{cim_label('VoltageLevel')})-[:`{cim_prop('VoltageLevel.Subs
 OPTIONAL MATCH (pt2:{cim_label('PowerTransformer')})-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(vl2)
 OPTIONAL MATCH (pte2:{cim_label('PowerTransformerEnd')})-[:`{cim_prop('PowerTransformerEnd.PowerTransformer')}`]->(pt2)
 WHERE pte2.`{cim_prop('TransformerEnd.endNumber')}` = 1
+// Aggregate first, add second — same 5.24 restriction as above.
+WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
+     lineSegments, loads, protectionRelays, voltages, totalMVA_direct,
+     sum(CASE WHEN pte2 IS NOT NULL THEN toFloat(pte2.`{cim_prop('PowerTransformerEnd.ratedS')}`) ELSE 0 END) AS totalMVA_vl
 WITH s, r, totalEquipment, breakers, disconnectors, transformers, busbars,
      lineSegments, loads, protectionRelays, voltages,
-     totalMVA_direct + sum(CASE WHEN pte2 IS NOT NULL THEN toFloat(pte2.`{cim_prop('PowerTransformerEnd.ratedS')}`) ELSE 0 END) AS totalMVA
+     totalMVA_direct + totalMVA_vl AS totalMVA
 
 RETURN
   s.`{cim_prop('IdentifiedObject.name')}` AS substation,
