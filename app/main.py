@@ -18,8 +18,9 @@ import re
 import asyncio
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any
 from contextlib import asynccontextmanager
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from telemetry import extract_telemetry
+from fleet_report import (
+    build_caveats, render_inventory, render_devices,
+    render_models, render_coverage,
+)
 from neo4j_client import (
     get_async_driver, close_async_driver, execute_cypher_async, check_neo4j_async,
     cim_label, cim_prop, CIM,
@@ -42,6 +47,9 @@ from neo4j_client import (
     cypher_substation_summary, cypher_substation_protection,
     cypher_substation_scada, cypher_substation_network,
     cypher_cross_layer, cypher_protection_map, cypher_comms_path,
+    cypher_fleet_devices, cypher_fleet_inventory, cypher_fleet_models,
+    cypher_fleet_search, cypher_fleet_coverage, cypher_fleet_catalog_health,
+    FLEET_DIMENSIONS,
     PROTOCOL_NAMES,
     NEO4J_URI,
 )
@@ -1051,6 +1059,212 @@ async def equipment_comms_path(device_name: str, max_hops: int = Query(4, ge=1, 
         raise HTTPException(500, str(e))
 
 
+# ── Fleet Scope ─────────────────────────────────────────────────────────
+# Every endpoint above answers "what is at this site". These answer "which
+# sites have this" — the inversion that turns a per-substation twin into a
+# fleet one, and the shape every standing report needs.
+#
+# Each returns `rendered` markdown alongside the rows, for the same reason the
+# telemetry contract does: the reports view and the chat agent then present
+# identical numbers because they are reading the same string, rather than each
+# assembling a table and drifting.
+
+FLEET_FILTER_KEYS = ("model", "manufacturer", "firmware", "type", "function", "site")
+
+
+def _fleet_params(
+    model: Optional[str] = None,
+    manufacturer: Optional[str] = None,
+    firmware: Optional[str] = None,
+    type: Optional[str] = None,
+    function: Optional[str] = None,
+    site: Optional[str] = None,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Bind every filter, present or not.
+
+    Cypher needs each parameter to exist even when it is not being filtered
+    on — a missing parameter is an error, whereas a null one means "match
+    everything", which is what an absent query string should do.
+    """
+    return {
+        "model": model, "manufacturer": manufacturer, "firmware": firmware,
+        "type": type, "function": function, "site": site, "limit": limit,
+    }
+
+
+async def _fleet_coverage_block() -> Dict[str, Any]:
+    """Coverage plus catalog health, merged — what a caveat list is built from."""
+    coverage, health = await asyncio.gather(
+        execute_cypher_async(cypher_fleet_coverage(), {}),
+        execute_cypher_async(cypher_fleet_catalog_health(), {}),
+        return_exceptions=True,
+    )
+    block: Dict[str, Any] = {}
+    if isinstance(coverage, list) and coverage:
+        block.update(coverage[0])
+    if isinstance(health, list) and health:
+        block.update(health[0])
+    return block
+
+
+@app.get("/api/fleet/devices")
+async def fleet_devices(
+    model: Optional[str] = None,
+    manufacturer: Optional[str] = None,
+    firmware: Optional[str] = None,
+    type: Optional[str] = None,
+    function: Optional[str] = None,
+    site: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
+):
+    """Devices across every site matching an attribute filter.
+
+    "Which sites have SEL-487E relays", "where are we running this firmware",
+    "every device with an 87T element". Filters are optional, case-insensitive
+    substrings, and AND together.
+    """
+    try:
+        filters = _fleet_params(model, manufacturer, firmware, type, function, site, limit)
+        rows = await execute_cypher_async(cypher_fleet_devices(), filters)
+        coverage = await _fleet_coverage_block()
+        shown = {k: v for k, v in filters.items() if k in FLEET_FILTER_KEYS}
+        caveats = build_caveats(coverage)
+        by_site: Dict[str, int] = {}
+        for row in rows:
+            key = row.get("site") or "(unassigned)"
+            by_site[key] = by_site.get(key, 0) + 1
+        return {
+            "success": True,
+            "filters": shown,
+            "device_count": len(rows),
+            "by_site": by_site,
+            "devices": rows,
+            "caveats": caveats,
+            "rendered": render_devices(rows, shown, caveats,
+                                       truncated=len(rows) >= limit),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/fleet/inventory")
+async def fleet_inventory(
+    dimension: Annotated[str, Query(
+        description="model|manufacturer|type|function|firmware|site")] = "type",
+    model: Optional[str] = None,
+    manufacturer: Optional[str] = None,
+    firmware: Optional[str] = None,
+    type: Optional[str] = None,
+    function: Optional[str] = None,
+    site: Optional[str] = None,
+):
+    """Fleet-wide counts for one dimension, pivoted by site.
+
+    The backbone of a standing report: how many of what, and where. A device
+    with several ANSI functions is counted under each of them; every other
+    dimension counts a device once.
+    """
+    if dimension not in FLEET_DIMENSIONS:
+        raise HTTPException(
+            400, f"dimension must be one of {', '.join(FLEET_DIMENSIONS)}")
+    try:
+        filters = _fleet_params(model, manufacturer, firmware, type, function, site)
+        rows = await execute_cypher_async(cypher_fleet_inventory(dimension), filters)
+        coverage = await _fleet_coverage_block()
+        shown = {k: v for k, v in filters.items() if k in FLEET_FILTER_KEYS}
+        caveats = build_caveats(coverage)
+        rendered, sites, totals = render_inventory(rows, dimension, shown, caveats)
+        return {
+            "success": True,
+            "dimension": dimension,
+            "filters": shown,
+            "sites": sites,
+            "totals": totals,
+            "rows": rows,
+            "caveats": caveats,
+            "rendered": rendered,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/fleet/models")
+async def fleet_models():
+    """The device model catalog, and which sites actually run each model.
+
+    Walks outward from each model node rather than scanning devices, which is
+    the cheap direction and the reason a fleet question about a model is
+    faster than the per-substation endpoints it complements.
+    """
+    try:
+        rows = await execute_cypher_async(cypher_fleet_models(), {})
+        in_use = [r for r in rows if (r.get("deviceCount") or 0) > 0]
+        return {
+            "success": True,
+            "catalog_count": len(rows),
+            "in_use_count": len(in_use),
+            "models": rows,
+            "rendered": render_models(rows),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/fleet/search")
+async def fleet_search(
+    q: Annotated[str, Query(
+        min_length=1, description="Free text: name, model, manufacturer, type")],
+    limit: Annotated[int, Query(ge=1, le=500)] = 50,
+):
+    """Open-ended lookup across the fleet when no typed filter fits.
+
+    The bounded alternative to letting the agent write Cypher for "find
+    whatever" — it searches names, models, descriptions and manufacturers, and
+    ranks exact name matches first.
+    """
+    try:
+        rows = await execute_cypher_async(cypher_fleet_search(), {"q": q, "limit": limit})
+        return {
+            "success": True,
+            "query": q,
+            "match_count": len(rows),
+            "matches": rows,
+            "rendered": render_devices(rows, {"search": q},
+                                       truncated=len(rows) >= limit),
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/fleet/coverage")
+async def fleet_coverage():
+    """How complete the fleet data is, and what any fleet number is missing.
+
+    Exists because the dangerous failure of a rollup is the silent one: a
+    device that never appears because nothing ties it to a site still leaves a
+    plausible-looking total behind. This names those devices, reports which
+    resolution path found everything else, and surfaces catalog duplication
+    that would double-count a hand-written query.
+    """
+    try:
+        coverage = await _fleet_coverage_block()
+        if not coverage:
+            raise HTTPException(500, "coverage query returned nothing")
+        return {
+            "success": True,
+            **coverage,
+            "caveats": build_caveats(coverage),
+            "rendered": render_coverage(coverage),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 # ── Batch Composition ───────────────────────────────────────────────────
 # A compound question costs one agent turn per lookup, and each turn pays the
 # full prompt plus the model's reasoning. Batching lets the caller ask for
@@ -1064,6 +1278,12 @@ class BatchRequest(BaseModel):
         description="Endpoint paths to fetch, e.g. ['api/substations/Annfield/protection']",
     )
 
+
+# Fleet paths carry their filters in a query string, and a fleet call without
+# its filters is a different question rather than a broader one — so these
+# patterns keep the query string as a named group instead of discarding it.
+_FLEET = r"^api/fleet/"
+_QS = r"(?:\?(?P<query>.*))?$"
 
 # Path patterns the batch endpoint is allowed to dispatch to. Kept as an
 # explicit allowlist so batching can never reach a mutating route.
@@ -1084,19 +1304,49 @@ _BATCH_ROUTES = [
     (r"^api/equipment/([^/]+)/comms-path$",         lambda m: equipment_comms_path(m.group(1))),
     (r"^api/equipment/([^/]+)/connected$",          lambda m: get_equipment_connected(m.group(1))),
     (r"^api/equipment/([^/]+)/isolation-boundary$", lambda m: get_isolation_boundary(m.group(1))),
+    (_FLEET + "devices" + _QS,   lambda m: fleet_devices(**_fleet_query(m))),
+    (_FLEET + "inventory" + _QS, lambda m: fleet_inventory(**_fleet_query(m))),
+    (_FLEET + "search" + _QS,    lambda m: fleet_search(**_fleet_query(m))),
+    (_FLEET + "models" + _QS,    lambda m: fleet_models()),
+    (_FLEET + "coverage" + _QS,  lambda m: fleet_coverage()),
     (r"^api/network-summary$",                      lambda m: network_summary()),
     (r"^api/substations$",                          lambda m: list_substations_endpoint()),
     (r"^api/stats$",                                lambda m: graph_stats()),
 ]
 
 
+# Query-string arguments a batched fleet call may pass through. An allowlist,
+# so a crafted batch path can never reach a handler keyword it was not meant to.
+_FLEET_QUERY_KEYS = {"model", "manufacturer", "firmware", "type", "function",
+                     "site", "dimension", "q", "limit"}
+
+
+def _fleet_query(match) -> Dict[str, Any]:
+    """Keyword arguments parsed from a batched fleet path's query string."""
+    raw = (match.groupdict().get("query") or "") if match else ""
+    kwargs: Dict[str, Any] = {}
+    for key, values in parse_qs(raw).items():
+        if key not in _FLEET_QUERY_KEYS or not values:
+            continue
+        value = values[0]
+        kwargs[key] = int(value) if key == "limit" and value.isdigit() else value
+    return kwargs
+
+
 def _dispatch_batch(path: str):
-    """Resolve one batch path to its handler coroutine, or None if not allowed."""
-    cleaned = path.strip().lstrip("/").split("?")[0]
-    for pattern, factory in _BATCH_ROUTES:
-        match = re.match(pattern, cleaned)
-        if match:
-            return factory(match)
+    """Resolve one batch path to its handler coroutine, or None if not allowed.
+
+    Tried against the full path first so a fleet route can capture its query
+    string, then against the bare path so every other route keeps behaving as
+    it did when query strings were simply discarded.
+    """
+    cleaned = path.strip().lstrip("/")
+    base = cleaned.split("?")[0]
+    for candidate in (cleaned, base):
+        for pattern, factory in _BATCH_ROUTES:
+            match = re.match(pattern, candidate)
+            if match:
+                return factory(match)
     return None
 
 

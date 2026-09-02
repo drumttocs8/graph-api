@@ -794,6 +794,33 @@ ORDER BY eq1Name, eq2Name
 # fall back to the containment CTE.
 
 
+def _catalog_joins(dev: str = "d", model: str = "dm", mfr: str = "mfr") -> str:
+    """Hops to a device's model and manufacturer, collapsed to one node each.
+
+    The reference catalog holds duplicate nodes for every model, manufacturer
+    and ANSI function, so a bare OPTIONAL MATCH returns a row per duplicate
+    and a per-device query silently returns two rows per device. Ordering by
+    elementId makes the choice deterministic rather than merely arbitrary, so
+    repeated calls agree with each other.
+
+    Pass `mfr=None` when only the model is needed.
+    """
+    parts = [f"""
+CALL {{
+    WITH {dev}
+    OPTIONAL MATCH ({dev})-[:`{VER}HAS_DEVICE_MODEL`]->(_dm)
+    RETURN _dm AS {model} ORDER BY elementId(_dm) LIMIT 1
+}}"""]
+    if mfr:
+        parts.append(f"""
+CALL {{
+    WITH {model}
+    OPTIONAL MATCH ({model})-[:`{VER}MADE_BY`]->(_mfr)
+    RETURN _mfr AS {mfr} ORDER BY elementId(_mfr) LIMIT 1
+}}""")
+    return "\n".join(parts)
+
+
 def _ver_devices_by_substation(labels: List[str]) -> str:
     """Subquery: find ns1__/cim__ secondary-system devices belonging to a substation.
 
@@ -867,8 +894,7 @@ WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
 {_ver_devices_by_substation(relay_labels)}
 WITH DISTINCT d AS r
-OPTIONAL MATCH (r)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
-OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+{_catalog_joins('r')}
 OPTIONAL MATCH (dm)-[:`{VER}SUPPORTS_FUNCTION`]->(fn)
 WITH r, dm, mfr,
      collect(DISTINCT CASE WHEN fn IS NULL THEN null ELSE
@@ -899,8 +925,7 @@ WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
 {_ver_devices_by_substation(scada_labels)}
 WITH DISTINCT d
-OPTIONAL MATCH (d)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
-OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+{_catalog_joins('d')}
 RETURN
   coalesce(d.`{cim_prop('IdentifiedObject.name')}`, d.`{VER}name`) AS name,
   [lbl IN labels(d) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
@@ -928,8 +953,7 @@ WHERE s.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
 WITH s
 {_ver_devices_by_substation(net_labels)}
 WITH DISTINCT d
-OPTIONAL MATCH (d)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
-OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(mfr)
+{_catalog_joins('d')}
 RETURN
   coalesce(d.`{cim_prop('IdentifiedObject.name')}`, d.`{VER}name`) AS name,
   [lbl IN labels(d) WHERE (lbl STARTS WITH '{CIM}' OR lbl STARTS WITH '{VER}')
@@ -1140,7 +1164,7 @@ WHERE any(lbl IN labels(r) WHERE lbl CONTAINS 'ProtectiveRelay' OR lbl CONTAINS 
         WHERE c.`{cim_prop('IdentifiedObject.name')}` =~ $substation_name
     }}
   )
-OPTIONAL MATCH (r)-[:`{VER}HAS_DEVICE_MODEL`]->(dm)
+{_catalog_joins('r', mfr=None)}
 RETURN
   r.`{cim_prop('IdentifiedObject.name')}` AS relay,
   coalesce(dm.`{VER}model_number`, r.`{VER}relay_model`, r.`scada__RELAY_MODEL`) AS relayModel,
@@ -1199,4 +1223,419 @@ WITH route, hopCount, endpointType, linkTypes,
 RETURN route, hopCount, endpointType, linkTypes AS protocols
 ORDER BY destRank, hopCount, endpointType
 LIMIT 12
+"""
+
+
+# ── Fleet Scope ──────────────────────────────────────────────────────────
+#
+# Every endpoint above scopes to one substation and then describes it. Fleet
+# queries invert that: start from an attribute, then find out which sites it
+# lands in. The cost scales with the number of *matches* rather than the size
+# of the fleet, because the starting set comes from a lookup and the site comes
+# from following relationships rather than scanning every container.
+#
+# Where a dimension is already a node — device model, manufacturer, ANSI
+# function — the query starts at that single node and walks its incoming
+# edges. "Which sites run this relay model" is therefore cheaper than the
+# per-substation endpoints it complements, not more expensive.
+#
+# Duplication note: the reference catalog in the current graph is double
+# loaded — every manufacturer, model and ANSI function exists as two nodes.
+# Joining through them naively multiplies rows, which silently inflates counts
+# (99 breakers reported against 96 that exist). Every join below therefore
+# collapses to one node deterministically, and the duplication is reported by
+# /api/fleet/coverage rather than hidden. Fixing the data is an ingest
+# concern; being wrong about a count is not something a report can afford to
+# wait on.
+
+# Node types worth reporting on across the fleet. An allowlist rather than a
+# deny-list: terminals, diagram furniture, limit sets and position points
+# outnumber real devices roughly four to one and would swamp every rollup.
+FLEET_LABELS: List[str] = [
+    # Primary electrical plant
+    f"{CIM}Breaker", f"{CIM}Disconnector", f"{CIM}LoadBreakSwitch",
+    f"{CIM}Recloser", f"{CIM}GroundDisconnector", f"{CIM}Jumper",
+    f"{CIM}Switch", f"{CIM}PowerTransformer", f"{CIM}BusbarSection",
+    f"{CIM}EnergyConsumer", f"{CIM}ACLineSegment",
+    f"{CIM}PowerElectronicsConnection", f"{CIM}BatteryUnit",
+    f"{CIM}PhotovoltaicUnit", f"{CIM}VsConverter",
+    # Protection
+    f"{CIM}ProtectiveRelay", f"{CIM}CurrentRelay", f"{VER}ProtectiveRelay",
+    # SCADA, control and network
+    f"{CIM}RemoteUnit", f"{CIM}PortServer",
+    f"{VER}RemoteUnit", f"{VER}ControlCenter", f"{VER}HMI", f"{VER}Historian",
+    f"{VER}PPC", f"{VER}BESSController", f"{VER}PortServer",
+    f"{VER}NetworkSwitch", f"{VER}Router", f"{VER}Firewall",
+]
+
+# Dimensions a fleet rollup can pivot on. Each maps to a Cypher expression
+# yielding a *list*, so a device with several ANSI functions counts once per
+# function while a device with one model counts once.
+FLEET_DIMENSIONS = ("model", "manufacturer", "type", "function", "firmware", "site")
+
+
+def _fleet_label_filter(var: str = "d") -> str:
+    labels = ", ".join(f"'{lbl}'" for lbl in FLEET_LABELS)
+    return f"any(lbl IN labels({var}) WHERE lbl IN [{labels}])"
+
+
+def _fleet_model_expr(dev: str = "d", model: str = "dm") -> str:
+    """Model number, whether it came from a linked node or a raw string.
+
+    Most of the catalog is normalised into `ns1__DeviceModel` nodes, but some
+    devices carry the model only as text from SCADA or the editor. A rollup
+    that read only the node would silently omit those.
+    """
+    return (f"coalesce({model}.`{VER}model_number`, {dev}.`{VER}relay_model`, "
+            f"{dev}.`scada__RELAY_MODEL`)")
+
+
+def _fleet_firmware_expr(dev: str = "d", fw: str = "fw") -> str:
+    """Firmware version, from a linked node if present, else a property.
+
+    Firmware is shared across many devices and is what advisories and upgrade
+    campaigns pivot on, so it belongs on a node the way model does. The
+    property fallbacks let manual entry and relay-config ingest work before
+    that normalisation exists.
+    """
+    return (f"coalesce({fw}.`{VER}version`, {dev}.`{VER}firmware_version`, "
+            f"{dev}.`{VER}firmware`, {dev}.`scada__FIRMWARE_VERSION`)")
+
+
+def _fleet_mfr_expr(mfr: str = "mfr") -> str:
+    return f"coalesce({mfr}.`{VER}name`, {mfr}.`{cim_prop('IdentifiedObject.name')}`)"
+
+
+def _fleet_attribute_joins() -> str:
+    """Hops to the nodes carrying a device's catalog attributes, one each.
+
+    Each is a subquery ending in LIMIT 1 rather than a bare OPTIONAL MATCH.
+    The catalog currently holds two nodes for every manufacturer, model and
+    function, so a plain OPTIONAL MATCH returns a row per duplicate and every
+    downstream count doubles. Collapsing here keeps one row per device no
+    matter how many duplicate catalog nodes a device happens to reach.
+    """
+    return f"""
+{_catalog_joins('d')}
+CALL {{
+    WITH d
+    OPTIONAL MATCH (d)-[:`{VER}RUNS_FIRMWARE`]->(v)
+    RETURN v AS fw ORDER BY v.`{VER}version` DESC, elementId(v) LIMIT 1
+}}
+"""
+
+
+def _fleet_site_resolution(carry: str = "") -> str:
+    """Cypher: resolve `d` to its substation, recording which path found it.
+
+    Three paths, cheapest first:
+      1. the denormalised `ns1__substationName` written at ingest
+      2. the CIM containment chain (Bay / VoltageLevel / Feeder → Substation)
+      3. for a relay, the switch it protects, then that switch's container
+
+    `via` is carried out rather than discarded so an answer can state its own
+    coverage. A device that resolves to nothing is a real finding — usually an
+    editor artifact that was never bound to a site — and dropping it silently
+    would understate every rollup built on top of this.
+
+    `carry` is a comma-prefixed list of variables to keep in scope across the
+    subqueries, e.g. ", dm, mfr, fw".
+    """
+    def up(var: str) -> str:
+        return (f"-[:`{cim_prop('Bay.VoltageLevel')}`"
+                f"|`{cim_prop('VoltageLevel.Substation')}`"
+                f"|`{cim_prop('Feeder.NormalEnergizingSubstation')}`*0..2]->"
+                f"({var}:{cim_label('Substation')})")
+
+    name = cim_prop("IdentifiedObject.name")
+    return f"""
+CALL {{
+    WITH d
+    OPTIONAL MATCH (d)-[:`{cim_prop('Equipment.EquipmentContainer')}`]->(){up('subA')}
+    RETURN subA.`{name}` AS viaContainer ORDER BY viaContainer LIMIT 1
+}}
+CALL {{
+    WITH d
+    OPTIONAL MATCH (d)-[:`{cim_prop('ProtectionEquipment.ProtectedSwitch')}`]-(psw)
+                     -[:`{cim_prop('Equipment.EquipmentContainer')}`]->(){up('subB')}
+    RETURN subB.`{name}` AS viaSwitch ORDER BY viaSwitch LIMIT 1
+}}
+WITH d{carry},
+     coalesce(d.`{VER}substationName`, viaContainer, viaSwitch) AS site,
+     CASE
+       WHEN d.`{VER}substationName` IS NOT NULL THEN 'denormalized'
+       WHEN viaContainer IS NOT NULL             THEN 'containment'
+       WHEN viaSwitch    IS NOT NULL             THEN 'protected-switch'
+       ELSE 'unresolved'
+     END AS via
+"""
+
+
+def _fleet_filters() -> str:
+    """WHERE clause: every filter optional, ANDed, case-insensitive substring.
+
+    A null parameter means "do not filter on this", so one query serves
+    "all SEL relays", "everything at Annfield" and "the whole fleet".
+    """
+    return f"""
+WHERE ($model IS NULL OR toLower(coalesce({_fleet_model_expr()}, '')) CONTAINS toLower($model))
+  AND ($manufacturer IS NULL OR toLower(coalesce({_fleet_mfr_expr()}, '')) CONTAINS toLower($manufacturer))
+  AND ($firmware IS NULL OR toLower(coalesce({_fleet_firmware_expr()}, '')) CONTAINS toLower($firmware))
+  AND ($type IS NULL OR toLower(coalesce({_type_expr('d')}, '')) CONTAINS toLower($type))
+  AND ($function IS NULL OR EXISTS {{
+        MATCH (dm)-[:`{VER}SUPPORTS_FUNCTION`]->(qf)
+        WHERE toLower(coalesce(qf.`{VER}code`, '')) CONTAINS toLower($function)
+           OR toLower(coalesce(qf.`{VER}name`, '')) CONTAINS toLower($function)
+      }})
+"""
+
+
+def _fleet_functions_subquery() -> str:
+    """ANSI codes for a device's model, deduplicated across duplicate nodes."""
+    return f"""
+CALL {{
+    WITH dm
+    OPTIONAL MATCH (dm)-[:`{VER}SUPPORTS_FUNCTION`]->(fn)
+    RETURN [c IN collect(DISTINCT fn.`{VER}code`) WHERE c IS NOT NULL] AS ansiFunctions
+}}
+"""
+
+
+def cypher_fleet_devices() -> str:
+    """Cypher: devices across every site matching an attribute filter.
+
+    The inversion the per-substation endpoints cannot express — "which sites
+    have this" rather than "what is at this site". Telemetry is deliberately
+    not returned: a fleet answer is an inventory, and pulling every device's
+    SCADA points would make it an order of magnitude heavier for something no
+    rollup uses.
+    """
+    name = cim_prop("IdentifiedObject.name")
+    return f"""
+MATCH (d)
+WHERE {_fleet_label_filter()}
+{_fleet_attribute_joins()}
+WITH d, dm, mfr, fw
+{_fleet_filters()}
+{_fleet_site_resolution(", dm, mfr, fw")}
+WITH d, dm, mfr, fw, site, via
+WHERE ($site IS NULL OR toLower(coalesce(site, '')) CONTAINS toLower($site))
+{_fleet_functions_subquery()}
+RETURN
+  d.`{name}`                              AS name,
+  d.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
+  {_type_expr('d')}                       AS type,
+  site,
+  via,
+  {_fleet_model_expr()}                   AS model,
+  {_fleet_mfr_expr()}                     AS manufacturer,
+  {_fleet_firmware_expr()}                AS firmware,
+  dm.`{VER}description`                   AS modelDescription,
+  ansiFunctions
+ORDER BY site, type, name
+LIMIT $limit
+"""
+
+
+def cypher_fleet_inventory(dimension: str) -> str:
+    """Cypher: fleet-wide counts for one dimension, broken out by site.
+
+    The backbone of a standing report — how many of what, and where. Each
+    dimension yields a list so a device with several ANSI functions is counted
+    under each of them; every other dimension yields a single value.
+    """
+    if dimension not in FLEET_DIMENSIONS:
+        raise ValueError(f"unknown dimension '{dimension}'")
+
+    exprs = {
+        "model":        f"[{_fleet_model_expr()}]",
+        "manufacturer": f"[{_fleet_mfr_expr()}]",
+        "type":         f"[{_type_expr('d')}]",
+        "firmware":     f"[{_fleet_firmware_expr()}]",
+        "site":         "[site]",
+        "function":     "ansiFunctions",
+    }
+    return f"""
+MATCH (d)
+WHERE {_fleet_label_filter()}
+{_fleet_attribute_joins()}
+WITH d, dm, mfr, fw
+{_fleet_filters()}
+{_fleet_site_resolution(", dm, mfr, fw")}
+WITH d, dm, mfr, fw, site, via
+WHERE ($site IS NULL OR toLower(coalesce(site, '')) CONTAINS toLower($site))
+{_fleet_functions_subquery()}
+WITH d, site, {exprs[dimension]} AS vals
+UNWIND (CASE WHEN vals IS NULL OR size(vals) = 0 THEN [null] ELSE vals END) AS value
+WITH coalesce(value, '(not recorded)') AS value,
+     coalesce(site, '(unassigned)')    AS site,
+     count(DISTINCT d)                 AS devices
+RETURN value, site, devices
+ORDER BY value, site
+"""
+
+
+def cypher_fleet_models() -> str:
+    """Cypher: the device model catalog, with where each model is actually used.
+
+    Starts from the model node and walks its incoming edges — the cheap
+    direction. Grouped by model *number* rather than by node, because the
+    catalog holds duplicates; `catalogNodes` reports how many nodes collapsed
+    into each row so the duplication stays visible.
+
+    Models with no devices are returned too. An unused catalog entry is not an
+    error, but a catalog that is mostly unused says the linking step of ingest
+    has not kept up with it, which is worth seeing.
+    """
+    return f"""
+MATCH (dm:`{VER}DeviceModel`)
+CALL {{
+    WITH dm
+    OPTIONAL MATCH (dm)-[:`{VER}MADE_BY`]->(k)
+    RETURN {_fleet_mfr_expr('k')} AS mfrName ORDER BY elementId(k) LIMIT 1
+}}
+CALL {{
+    WITH dm
+    OPTIONAL MATCH (dm)-[:`{VER}SUPPORTS_FUNCTION`]->(fn)
+    RETURN [c IN collect(DISTINCT fn.`{VER}code`) WHERE c IS NOT NULL] AS fns
+}}
+OPTIONAL MATCH (dm)<-[:`{VER}HAS_DEVICE_MODEL`]-(d)
+{_fleet_site_resolution(", dm, mfrName, fns")}
+WITH
+  dm.`{VER}model_number`                            AS model,
+  head(collect(DISTINCT dm.`{VER}name`))            AS name,
+  head(collect(DISTINCT dm.`{VER}description`))     AS description,
+  head(collect(DISTINCT dm.`{VER}device_type`))     AS deviceType,
+  head([n IN collect(mfrName) WHERE n IS NOT NULL]) AS manufacturer,
+  coalesce(head([f IN collect(fns) WHERE size(f) > 0]), []) AS ansiFunctions,
+  count(DISTINCT d)                                 AS deviceCount,
+  count(DISTINCT dm)                                AS catalogNodes,
+  [s IN collect(DISTINCT site) WHERE s IS NOT NULL] AS sites
+RETURN model, name, description, deviceType, manufacturer,
+       ansiFunctions, deviceCount, catalogNodes, sites
+ORDER BY deviceCount DESC, model
+"""
+
+
+def cypher_fleet_search() -> str:
+    """Cypher: open-ended lookup across device names, models and descriptions.
+
+    The fallback for "find whatever" when no typed filter fits — the same role
+    Custom_Cypher plays for the agent, but bounded to real devices and to
+    fields worth searching. This is a scan, which is instant at a few thousand
+    nodes; past roughly a hundred thousand the upgrade is a Neo4j full-text
+    index over the same fields, which changes this query and nothing above it.
+    """
+    name = cim_prop("IdentifiedObject.name")
+    haystack = (f"coalesce(d.`{name}`, '') + ' ' + coalesce({_fleet_model_expr()}, '') "
+                f"+ ' ' + coalesce(dm.`{VER}description`, '') + ' ' "
+                f"+ coalesce({_fleet_mfr_expr()}, '') + ' ' + coalesce({_type_expr('d')}, '')")
+    return f"""
+MATCH (d)
+WHERE {_fleet_label_filter()}
+{_fleet_attribute_joins()}
+WITH d, dm, mfr, fw, {haystack} AS haystack
+WHERE toLower(haystack) CONTAINS toLower($q)
+{_fleet_site_resolution(", dm, mfr, fw")}
+RETURN
+  d.`{name}`                              AS name,
+  d.`{cim_prop('IdentifiedObject.mRID')}` AS mrid,
+  {_type_expr('d')}                       AS type,
+  site,
+  {_fleet_model_expr()}                   AS model,
+  {_fleet_mfr_expr()}                     AS manufacturer,
+  {_fleet_firmware_expr()}                AS firmware,
+  CASE
+    WHEN toLower(coalesce(d.`{name}`, '')) = toLower($q) THEN 0
+    WHEN toLower(coalesce(d.`{name}`, '')) STARTS WITH toLower($q) THEN 1
+    WHEN toLower(coalesce({_fleet_model_expr()}, '')) CONTAINS toLower($q) THEN 2
+    ELSE 3
+  END AS rank
+ORDER BY rank, site, name
+LIMIT $limit
+"""
+
+
+def cypher_fleet_coverage() -> str:
+    """Cypher: how complete the fleet data actually is.
+
+    A fleet answer is only as trustworthy as its weakest join, and the failure
+    mode that matters is the silent one — a device that never appears in a
+    rollup because nothing ties it to a site. This reports the resolution path
+    taken for every device, names the ones that resolve to nothing, and counts
+    how many carry each catalog attribute, so a report can state what it does
+    not know rather than quietly rounding it off.
+    """
+    name = cim_prop("IdentifiedObject.name")
+    return f"""
+MATCH (d)
+WHERE {_fleet_label_filter()}
+{_fleet_attribute_joins()}
+WITH d, dm, mfr, fw
+{_fleet_site_resolution(", dm, mfr, fw")}
+WITH d, dm, mfr, fw, site, via
+WITH
+  count(d)                                                   AS totalDevices,
+  count(DISTINCT site)                                       AS sites,
+  collect(CASE WHEN via = 'unresolved' THEN {{
+      name: d.`{name}`, type: {_type_expr('d')},
+      mrid: d.`{cim_prop('IdentifiedObject.mRID')}`
+  }} END)                                                    AS unresolvedRaw,
+  sum(CASE WHEN via = 'denormalized'     THEN 1 ELSE 0 END)  AS byDenormalized,
+  sum(CASE WHEN via = 'containment'      THEN 1 ELSE 0 END)  AS byContainment,
+  sum(CASE WHEN via = 'protected-switch' THEN 1 ELSE 0 END)  AS byProtectedSwitch,
+  sum(CASE WHEN via = 'unresolved'       THEN 1 ELSE 0 END)  AS unresolvedCount,
+  sum(CASE WHEN {_fleet_model_expr()}    IS NOT NULL THEN 1 ELSE 0 END) AS withModel,
+  sum(CASE WHEN dm                       IS NOT NULL THEN 1 ELSE 0 END) AS withModelNode,
+  sum(CASE WHEN mfr                      IS NOT NULL THEN 1 ELSE 0 END) AS withManufacturer,
+  sum(CASE WHEN {_fleet_firmware_expr()} IS NOT NULL THEN 1 ELSE 0 END) AS withFirmware
+RETURN
+  totalDevices, sites,
+  {{denormalized: byDenormalized, containment: byContainment,
+    protectedSwitch: byProtectedSwitch, unresolved: unresolvedCount}} AS siteResolution,
+  {{model: withModel, modelNode: withModelNode,
+    manufacturer: withManufacturer, firmware: withFirmware}}          AS attributeCoverage,
+  [u IN unresolvedRaw WHERE u IS NOT NULL]                            AS unresolvedDevices
+"""
+
+
+def cypher_fleet_catalog_health() -> str:
+    """Cypher: duplication and usage across the reference catalog.
+
+    Every join through the catalog is a place a count can double, so the
+    difference between distinct values and stored nodes is worth reporting
+    alongside any fleet number derived from them.
+    """
+    return f"""
+CALL {{
+    MATCH (dm:`{VER}DeviceModel`)
+    OPTIONAL MATCH (dm)<-[:`{VER}HAS_DEVICE_MODEL`]-(d)
+    WITH dm.`{VER}model_number` AS model, count(DISTINCT d) AS uses
+    RETURN
+      count(*)                                  AS catalogModels,
+      sum(CASE WHEN uses > 0 THEN 1 ELSE 0 END) AS modelsInUse,
+      sum(CASE WHEN uses = 0 THEN 1 ELSE 0 END) AS modelsUnlinked,
+      sum(uses)                                 AS devicesLinked
+}}
+CALL {{
+    MATCH (n:`{VER}DeviceModel`)
+    WITH n.`{VER}model_number` AS v, count(*) AS c
+    RETURN {{entity: 'DeviceModel', distinctValues: count(*), nodes: sum(c),
+             duplicated: sum(CASE WHEN c > 1 THEN 1 ELSE 0 END)}} AS dupModels
+}}
+CALL {{
+    MATCH (n:`{VER}Manufacturer`)
+    WITH coalesce(n.`{VER}name`, n.`{cim_prop('IdentifiedObject.name')}`) AS v, count(*) AS c
+    RETURN {{entity: 'Manufacturer', distinctValues: count(*), nodes: sum(c),
+             duplicated: sum(CASE WHEN c > 1 THEN 1 ELSE 0 END)}} AS dupMfrs
+}}
+CALL {{
+    MATCH (n:`{VER}ANSIFunction`)
+    WITH n.`{VER}code` AS v, count(*) AS c
+    RETURN {{entity: 'ANSIFunction', distinctValues: count(*), nodes: sum(c),
+             duplicated: sum(CASE WHEN c > 1 THEN 1 ELSE 0 END)}} AS dupFns
+}}
+RETURN
+  catalogModels, modelsInUse, modelsUnlinked, devicesLinked,
+  [dupModels, dupMfrs, dupFns] AS duplication
 """
